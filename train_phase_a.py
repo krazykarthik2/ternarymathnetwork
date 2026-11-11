@@ -2,10 +2,9 @@
 BitNet b1.58 Multi-GPU / Distributed Pre-Training Engine (Phase A).
 Supports:
 - Model specifications: BitNet-125M (12 layers, d=768, h=12) & BitNet-350M (24 layers, d=1024, h=16)
-- Datasets: HuggingFace streaming for SlimPajama, TinyStories, C4, WikiText-103
+- Pre-packaged small subsets: sample-10BT / sample-100BT (no 5 TB downloads)
+- Streaming: True zero-disk memory streaming
 - Precision: Mixed precision (torch.cuda.amp.autocast bf16/fp16)
-- Distributed: DDP (DistributedDataParallel) / multi-GPU readiness
-- Logging: Per-step discrete telemetry, quantization shockwave detection, and evaluation gap
 """
 import os
 import sys
@@ -22,11 +21,12 @@ from device_utils import get_device, get_device_info
 
 class HFStreamDataset(IterableDataset):
     """
-    Streaming dataset wrapper for massive online datasets (SlimPajama / TinyStories / C4).
-    Enables immediate token streaming without downloading multi-gigabyte files locally first.
+    Streaming dataset wrapper for HuggingFace datasets.
+    Supports specific lightweight subsets like 'sample-10BT' to avoid multi-terabyte indexes.
     """
-    def __init__(self, dataset_name="roneneldan/TinyStories", split="train", seq_len=512, tokenizer=None):
+    def __init__(self, dataset_name="HuggingFaceFW/fineweb-edu", subset="sample-10BT", split="train", seq_len=512, tokenizer=None):
         self.dataset_name = dataset_name
+        self.subset = subset
         self.split = split
         self.seq_len = seq_len
         self.tokenizer = tokenizer
@@ -34,7 +34,12 @@ class HFStreamDataset(IterableDataset):
     def __iter__(self):
         try:
             from datasets import load_dataset
-            ds = load_dataset(self.dataset_name, split=self.split, streaming=True)
+            # Pass subset explicitly (e.g. 'sample-10BT') so it never touches the 5.8 TB default dump
+            if self.subset:
+                ds = load_dataset(self.dataset_name, name=self.subset, split=self.split, streaming=True)
+            else:
+                ds = load_dataset(self.dataset_name, split=self.split, streaming=True)
+            
             token_buffer = []
             for item in ds:
                 text = item.get("text", "") or item.get("story", "")
@@ -43,7 +48,7 @@ class HFStreamDataset(IterableDataset):
                 if self.tokenizer is not None:
                     ids = self.tokenizer.encode(text)
                 else:
-                    ids = [ord(c) % 256 for c in text]  # Fallback byte tokenizer
+                    ids = [ord(c) % 256 for c in text]
                 
                 token_buffer.extend(ids)
                 while len(token_buffer) >= self.seq_len + 1:
@@ -53,7 +58,6 @@ class HFStreamDataset(IterableDataset):
                     y = torch.tensor(chunk[1:], dtype=torch.long)
                     yield x, y
         except Exception as e:
-            # Fallback offline generator if HuggingFace is unreachable
             print(f"[Dataset] Streaming warning ({e}), falling back to internal synthetic token stream...")
             while True:
                 tokens = torch.randint(0, 256, (self.seq_len + 1,))
@@ -74,11 +78,10 @@ def train_phase_a(args):
     print("=" * 90)
     print(f"PHASE A: BITNET b1.58 CORE SCALE BENCHMARK [{args.scale}]")
     print(f"Hardware: {get_device_info()['name']}")
-    print(f"Method: {args.method.upper()} | Dataset: {args.dataset}")
-    print(f"Total Steps: {args.steps:,} | Batch Size: {args.batch_size} | Seq Len: {args.seq_len}")
+    print(f"Dataset: {args.dataset} (Subset: {args.subset}) | Streaming Mode (Zero Disk)")
+    print(f"Method: {args.method.upper()} | Steps: {args.steps:,} | Batch: {args.batch_size} | Seq Len: {args.seq_len}")
     print("=" * 90)
 
-    # Initialize Tokenizer (standard GPT2 or LLaMA tokenizer if available)
     try:
         from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained("gpt2")
@@ -87,31 +90,21 @@ def train_phase_a(args):
         tokenizer = None
         vocab_size = 256
 
-    model = get_model(scale=args.scale, method=args.method, vocab_size=vocab_size, max_seq_len=args.seq_len)
-    model = model.to(device)
+    model = get_model(scale=args.scale, method=args.method, vocab_size=vocab_size, max_seq_len=args.seq_len).to(device)
     print(f"Model instantiated. Total parameter count: {model.count_parameters():,}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01, betas=(0.9, 0.95))
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.steps, eta_min=args.lr * 0.1)
     criterion = nn.CrossEntropyLoss()
 
-    train_ds = HFStreamDataset(dataset_name=args.dataset, split="train", seq_len=args.seq_len, tokenizer=tokenizer)
+    train_ds = HFStreamDataset(dataset_name=args.dataset, subset=args.subset, split="train", seq_len=args.seq_len, tokenizer=tokenizer)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size)
     train_iter = iter(train_loader)
 
-    # Checkpoint saving directory
     ckpt_dir = os.path.join(args.output_dir, f"{args.scale}_{args.method}")
     os.makedirs(ckpt_dir, exist_ok=True)
 
-    metrics = {
-        "train_loss": [],
-        "train_ppl": [],
-        "discrete_loss": [],
-        "discrete_ppl": [],
-        "discretization_gap": [],
-        "steps": []
-    }
-
+    metrics = {"steps": [], "train_loss": [], "train_ppl": [], "discrete_loss": [], "discrete_ppl": [], "discretization_gap": []}
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
     start_time = time.time()
 
@@ -119,7 +112,6 @@ def train_phase_a(args):
         x, y = next(train_iter)
         x, y = x.to(device), y.to(device)
 
-        # Schedules
         T_val = 0.01 + 0.5 * (1.0 - 0.01) * (1.0 + math.cos(math.pi * step / args.steps))
         eps_val = 0.05 + 0.5 * (0.35 - 0.05) * (1.0 + math.cos(math.pi * step / args.steps))
         floor_val = 0.05 + 0.5 * (0.30 - 0.05) * (1.0 + math.cos(math.pi * step / args.steps))
@@ -141,12 +133,10 @@ def train_phase_a(args):
         scaler.update()
         scheduler.step()
 
-        # Telemetry & Evaluation
         if step % args.eval_interval == 0 or step == args.steps:
             train_loss_val = loss.item()
             train_ppl_val = math.exp(min(train_loss_val, 20.0))
 
-            # Snap to Discrete Evaluation to calculate the Discretization Gap Delta
             original_methods = {}
             for name, module in model.named_modules():
                 if hasattr(module, "method"):
@@ -160,14 +150,12 @@ def train_phase_a(args):
                     disc_loss = criterion(disc_logits.view(-1, vocab_size), y.view(-1)).item()
                     disc_ppl = math.exp(min(disc_loss, 20.0))
 
-            # Restore training methods
             for name, module in model.named_modules():
                 if name in original_methods:
                     module.method = original_methods[name]
             model.train()
 
             gap_delta = disc_ppl - train_ppl_val
-
             metrics["steps"].append(step)
             metrics["train_loss"].append(train_loss_val)
             metrics["train_ppl"].append(train_ppl_val)
@@ -178,29 +166,21 @@ def train_phase_a(args):
             elapsed = time.time() - start_time
             print(f"Step {step:6d}/{args.steps} | Train PPL: {train_ppl_val:7.2f} | Discrete PPL: {disc_ppl:7.2f} | Gap (Delta): {gap_delta:+6.2f} | Time: {elapsed:.1f}s")
 
-            # Save checkpoint
             if step % args.save_interval == 0 or step == args.steps:
                 ckpt_path = os.path.join(ckpt_dir, f"checkpoint_step_{step}.pt")
-                torch.save({
-                    "step": step,
-                    "model_state": model.state_dict(),
-                    "optimizer_state": optimizer.state_dict(),
-                    "metrics": metrics,
-                    "config": vars(args)
-                }, ckpt_path)
+                torch.save({"step": step, "model_state": model.state_dict(), "metrics": metrics, "config": vars(args)}, ckpt_path)
                 print(f"--> Saved checkpoint to: {ckpt_path}")
 
-    # Export metrics JSON
     with open(os.path.join(ckpt_dir, "metrics.json"), "w") as f:
         json.dump(metrics, f, indent=2)
-
     return metrics
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--scale", type=str, default="125M", choices=["125M", "350M"])
     parser.add_argument("--method", type=str, default="mige", choices=["ste", "temp_anneal", "mige"])
-    parser.add_argument("--dataset", type=str, default="roneneldan/TinyStories")
+    parser.add_argument("--dataset", type=str, default="HuggingFaceFW/fineweb-edu")
+    parser.add_argument("--subset", type=str, default="sample-10BT")
     parser.add_argument("--steps", type=int, default=10000)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--seq_len", type=int, default=512)
