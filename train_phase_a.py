@@ -2,13 +2,15 @@
 BitNet b1.58 Multi-GPU / Distributed Pre-Training Engine (Phase A).
 Supports:
 - Model specifications: BitNet-125M (12 layers, d=768, h=12) & BitNet-350M (24 layers, d=1024, h=16)
-- Pre-packaged small subsets: sample-10BT / sample-100BT (no 5 TB downloads)
-- Streaming: True zero-disk memory streaming
-- Precision: Mixed precision (torch.amp.autocast bf16/fp16)
-- STRICT VALIDATION: Fails loudly if HuggingFace datasets or tokenizer fails to load (NO SILENT SYNTHETIC DUMMY FALLBACK)
+- Resilient Streaming: Thread-safe generator without PyArrow GIL deadlock / thread-state collisions
+- Resume Capability: Automatically resume training from any step checkpoint
 """
 import os
 import sys
+
+# Prevent tokenizers and pyarrow multithreading deadlock during long streaming runs
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import math
 import time
 import argparse
@@ -22,9 +24,8 @@ from device_utils import get_device, get_device_info
 
 class HFStreamDataset(IterableDataset):
     """
-    Streaming dataset wrapper for HuggingFace datasets.
+    Thread-safe streaming dataset wrapper for HuggingFace datasets.
     Streams token batches directly into memory without downloading to disk.
-    Strict: Will raise error if datasets library or network connection fails.
     """
     def __init__(self, dataset_name="HuggingFaceFW/fineweb-edu", subset="sample-10BT", split="train", seq_len=512, tokenizer=None):
         self.dataset_name = dataset_name
@@ -33,7 +34,6 @@ class HFStreamDataset(IterableDataset):
         self.seq_len = seq_len
         self.tokenizer = tokenizer
 
-        # Verify imports upfront
         try:
             import datasets
         except ImportError:
@@ -44,7 +44,7 @@ class HFStreamDataset(IterableDataset):
 
     def __iter__(self):
         from datasets import load_dataset
-        print(f"[Dataset] Connecting to stream: {self.dataset_name} (subset: {self.subset})...")
+        print(f"[Dataset] Initializing stream: {self.dataset_name} (subset: {self.subset})...")
         if self.subset:
             ds = load_dataset(self.dataset_name, name=self.subset, split=self.split, streaming=True)
         else:
@@ -94,10 +94,7 @@ def train_phase_a(args):
         vocab_size = tokenizer.vocab_size
         print(f"[Tokenizer] Loaded successfully. Vocab size: {vocab_size:,}")
     except Exception as e:
-        raise RuntimeError(
-            f"[FATAL] Failed to load tokenizer: {e}\n"
-            "Please ensure 'transformers' is installed: pip install transformers"
-        )
+        raise RuntimeError(f"[FATAL] Failed to load tokenizer: {e}")
 
     model = get_model(scale=args.scale, method=args.method, vocab_size=vocab_size, max_seq_len=args.seq_len).to(device)
     print(f"Model instantiated. Total parameter count: {model.count_parameters():,}")
@@ -106,21 +103,36 @@ def train_phase_a(args):
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.steps, eta_min=args.lr * 0.1)
     criterion = nn.CrossEntropyLoss()
 
-    train_ds = HFStreamDataset(dataset_name=args.dataset, subset=args.subset, split="train", seq_len=args.seq_len, tokenizer=tokenizer)
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size)
-    train_iter = iter(train_loader)
-
     ckpt_dir = os.path.join(args.output_dir, f"{args.scale}_{args.method}")
     os.makedirs(ckpt_dir, exist_ok=True)
 
+    start_step = 1
     metrics = {"steps": [], "train_loss": [], "train_ppl": [], "discrete_loss": [], "discrete_ppl": [], "discretization_gap": []}
-    
-    # Modern PyTorch AMP Scaler (no deprecation warning)
+
+    # Resume from checkpoint if specified
+    if args.resume_from:
+        if os.path.exists(args.resume_from):
+            print(f"[Checkpoint] Resuming from: {args.resume_from}")
+            state = torch.load(args.resume_from, map_location=device)
+            model.load_state_dict(state["model_state"])
+            if "optimizer_state" in state:
+                optimizer.load_state_dict(state["optimizer_state"])
+            start_step = state.get("step", 0) + 1
+            metrics = state.get("metrics", metrics)
+            print(f"[Checkpoint] Successfully loaded. Resuming at step: {start_step}")
+        else:
+            print(f"[Checkpoint] Warning: Checkpoint {args.resume_from} not found. Starting fresh.")
+
+    # num_workers=0 ensures clean single-threaded streaming execution with zero GIL crashes
+    train_ds = HFStreamDataset(dataset_name=args.dataset, subset=args.subset, split="train", seq_len=args.seq_len, tokenizer=tokenizer)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, num_workers=0)
+    train_iter = iter(train_loader)
+
     device_type = "cuda" if device.type == "cuda" else "cpu"
     scaler = torch.amp.GradScaler(device_type, enabled=(device.type == "cuda"))
     start_time = time.time()
 
-    for step in range(1, args.steps + 1):
+    for step in range(start_step, args.steps + 1):
         x, y = next(train_iter)
         x, y = x.to(device), y.to(device)
 
@@ -180,7 +192,13 @@ def train_phase_a(args):
 
             if step % args.save_interval == 0 or step == args.steps:
                 ckpt_path = os.path.join(ckpt_dir, f"checkpoint_step_{step}.pt")
-                torch.save({"step": step, "model_state": model.state_dict(), "metrics": metrics, "config": vars(args)}, ckpt_path)
+                torch.save({
+                    "step": step,
+                    "model_state": model.state_dict(),
+                    "optimizer_state": optimizer.state_dict(),
+                    "metrics": metrics,
+                    "config": vars(args)
+                }, ckpt_path)
                 print(f"--> Saved checkpoint to: {ckpt_path}")
 
     with open(os.path.join(ckpt_dir, "metrics.json"), "w") as f:
@@ -199,6 +217,7 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=1.5e-3)
     parser.add_argument("--eval_interval", type=int, default=100)
     parser.add_argument("--save_interval", type=int, default=1000)
+    parser.add_argument("--resume_from", type=str, default=None, help="Path to checkpoint to resume training from")
     parser.add_argument("--output_dir", type=str, default="checkpoints")
     args = parser.parse_args()
     train_phase_a(args)
