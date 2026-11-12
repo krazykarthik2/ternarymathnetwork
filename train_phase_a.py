@@ -4,7 +4,8 @@ Supports:
 - Model specifications: BitNet-125M (12 layers, d=768, h=12) & BitNet-350M (24 layers, d=1024, h=16)
 - Pre-packaged small subsets: sample-10BT / sample-100BT (no 5 TB downloads)
 - Streaming: True zero-disk memory streaming
-- Precision: Mixed precision (torch.cuda.amp.autocast bf16/fp16)
+- Precision: Mixed precision (torch.amp.autocast bf16/fp16)
+- STRICT VALIDATION: Fails loudly if HuggingFace datasets or tokenizer fails to load (NO SILENT SYNTHETIC DUMMY FALLBACK)
 """
 import os
 import sys
@@ -22,7 +23,8 @@ from device_utils import get_device, get_device_info
 class HFStreamDataset(IterableDataset):
     """
     Streaming dataset wrapper for HuggingFace datasets.
-    Supports specific lightweight subsets like 'sample-10BT' to avoid multi-terabyte indexes.
+    Streams token batches directly into memory without downloading to disk.
+    Strict: Will raise error if datasets library or network connection fails.
     """
     def __init__(self, dataset_name="HuggingFaceFW/fineweb-edu", subset="sample-10BT", split="train", seq_len=512, tokenizer=None):
         self.dataset_name = dataset_name
@@ -31,39 +33,42 @@ class HFStreamDataset(IterableDataset):
         self.seq_len = seq_len
         self.tokenizer = tokenizer
 
-    def __iter__(self):
+        # Verify imports upfront
         try:
-            from datasets import load_dataset
-            # Pass subset explicitly (e.g. 'sample-10BT') so it never touches the 5.8 TB default dump
-            if self.subset:
-                ds = load_dataset(self.dataset_name, name=self.subset, split=self.split, streaming=True)
-            else:
-                ds = load_dataset(self.dataset_name, split=self.split, streaming=True)
-            
-            token_buffer = []
-            for item in ds:
-                text = item.get("text", "") or item.get("story", "")
-                if not text:
-                    continue
-                if self.tokenizer is not None:
-                    ids = self.tokenizer.encode(text)
-                else:
-                    ids = [ord(c) % 256 for c in text]
-                
-                token_buffer.extend(ids)
-                while len(token_buffer) >= self.seq_len + 1:
-                    chunk = token_buffer[:self.seq_len + 1]
-                    token_buffer = token_buffer[self.seq_len:]
-                    x = torch.tensor(chunk[:-1], dtype=torch.long)
-                    y = torch.tensor(chunk[1:], dtype=torch.long)
-                    yield x, y
-        except Exception as e:
-            print(f"[Dataset] Streaming warning ({e}), falling back to internal synthetic token stream...")
-            while True:
-                tokens = torch.randint(0, 256, (self.seq_len + 1,))
-                yield tokens[:-1], tokens[1:]
+            import datasets
+        except ImportError:
+            raise ImportError(
+                "\n\n[FATAL] The 'datasets' library is not installed in this Python environment!\n"
+                "Please run: pip install datasets\n"
+            )
 
-def get_model(scale="125M", method="mige", vocab_size=32000, max_seq_len=512):
+    def __iter__(self):
+        from datasets import load_dataset
+        print(f"[Dataset] Connecting to stream: {self.dataset_name} (subset: {self.subset})...")
+        if self.subset:
+            ds = load_dataset(self.dataset_name, name=self.subset, split=self.split, streaming=True)
+        else:
+            ds = load_dataset(self.dataset_name, split=self.split, streaming=True)
+        
+        token_buffer = []
+        for item in ds:
+            text = item.get("text", "") or item.get("story", "")
+            if not text:
+                continue
+            if self.tokenizer is not None:
+                ids = self.tokenizer.encode(text)
+            else:
+                ids = [ord(c) % 256 for c in text]
+            
+            token_buffer.extend(ids)
+            while len(token_buffer) >= self.seq_len + 1:
+                chunk = token_buffer[:self.seq_len + 1]
+                token_buffer = token_buffer[self.seq_len:]
+                x = torch.tensor(chunk[:-1], dtype=torch.long)
+                y = torch.tensor(chunk[1:], dtype=torch.long)
+                yield x, y
+
+def get_model(scale="125M", method="mige", vocab_size=50257, max_seq_len=512):
     if scale == "125M":
         return BitNet125M(vocab_size=vocab_size, dim=768, n_layers=12, n_heads=12,
                           hidden_dim=2048, max_seq_len=max_seq_len, method=method)
@@ -84,11 +89,15 @@ def train_phase_a(args):
 
     try:
         from transformers import AutoTokenizer
+        print("[Tokenizer] Loading GPT-2 BPE tokenizer...")
         tokenizer = AutoTokenizer.from_pretrained("gpt2")
         vocab_size = tokenizer.vocab_size
-    except Exception:
-        tokenizer = None
-        vocab_size = 256
+        print(f"[Tokenizer] Loaded successfully. Vocab size: {vocab_size:,}")
+    except Exception as e:
+        raise RuntimeError(
+            f"[FATAL] Failed to load tokenizer: {e}\n"
+            "Please ensure 'transformers' is installed: pip install transformers"
+        )
 
     model = get_model(scale=args.scale, method=args.method, vocab_size=vocab_size, max_seq_len=args.seq_len).to(device)
     print(f"Model instantiated. Total parameter count: {model.count_parameters():,}")
@@ -105,7 +114,10 @@ def train_phase_a(args):
     os.makedirs(ckpt_dir, exist_ok=True)
 
     metrics = {"steps": [], "train_loss": [], "train_ppl": [], "discrete_loss": [], "discrete_ppl": [], "discretization_gap": []}
-    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+    
+    # Modern PyTorch AMP Scaler (no deprecation warning)
+    device_type = "cuda" if device.type == "cuda" else "cpu"
+    scaler = torch.amp.GradScaler(device_type, enabled=(device.type == "cuda"))
     start_time = time.time()
 
     for step in range(1, args.steps + 1):
@@ -122,7 +134,7 @@ def train_phase_a(args):
                     m.floor_grad = floor_val
 
         optimizer.zero_grad()
-        with torch.cuda.amp.autocast(enabled=(device.type == "cuda"), dtype=torch.bfloat16):
+        with torch.amp.autocast(device_type, enabled=(device.type == "cuda"), dtype=torch.bfloat16):
             logits = model(x, T=T_val, epsilon=eps_val)
             loss = criterion(logits.view(-1, vocab_size), y.view(-1))
 
@@ -145,7 +157,7 @@ def train_phase_a(args):
 
             model.eval()
             with torch.no_grad():
-                with torch.cuda.amp.autocast(enabled=(device.type == "cuda"), dtype=torch.bfloat16):
+                with torch.amp.autocast(device_type, enabled=(device.type == "cuda"), dtype=torch.bfloat16):
                     disc_logits = model(x)
                     disc_loss = criterion(disc_logits.view(-1, vocab_size), y.view(-1)).item()
                     disc_ppl = math.exp(min(disc_loss, 20.0))
