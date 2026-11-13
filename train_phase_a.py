@@ -4,6 +4,7 @@ Supports:
 - Model specifications: BitNet-125M (12 layers, d=768, h=12) & BitNet-350M (24 layers, d=1024, h=16)
 - Resilient Streaming: Thread-safe generator without PyArrow GIL deadlock / thread-state collisions
 - Resume Capability: Automatically resume training from any step checkpoint
+- Frequent Checkpoints: Default save interval reduced to 200 steps to protect against platform interruptions
 """
 import os
 import sys
@@ -109,7 +110,15 @@ def train_phase_a(args):
     start_step = 1
     metrics = {"steps": [], "train_loss": [], "train_ppl": [], "discrete_loss": [], "discrete_ppl": [], "discretization_gap": []}
 
-    # Resume from checkpoint if specified
+    # Auto-resume from latest checkpoint if one exists and resume_from not specified
+    if args.resume_from is None:
+        existing_ckpts = [f for f in os.listdir(ckpt_dir) if f.startswith("checkpoint_step_") and f.endswith(".pt")]
+        if existing_ckpts:
+            # Sort by step number
+            existing_ckpts.sort(key=lambda x: int(x.split("_")[2].split(".")[0]))
+            args.resume_from = os.path.join(ckpt_dir, existing_ckpts[-1])
+            print(f"[Auto-Resume] Found existing checkpoint: {args.resume_from}")
+
     if args.resume_from:
         if os.path.exists(args.resume_from):
             print(f"[Checkpoint] Resuming from: {args.resume_from}")
@@ -123,7 +132,6 @@ def train_phase_a(args):
         else:
             print(f"[Checkpoint] Warning: Checkpoint {args.resume_from} not found. Starting fresh.")
 
-    # num_workers=0 ensures clean single-threaded streaming execution with zero GIL crashes
     train_ds = HFStreamDataset(dataset_name=args.dataset, subset=args.subset, split="train", seq_len=args.seq_len, tokenizer=tokenizer)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, num_workers=0)
     train_iter = iter(train_loader)
@@ -190,6 +198,7 @@ def train_phase_a(args):
             elapsed = time.time() - start_time
             print(f"Step {step:6d}/{args.steps} | Train PPL: {train_ppl_val:7.2f} | Discrete PPL: {disc_ppl:7.2f} | Gap (Delta): {gap_delta:+6.2f} | Time: {elapsed:.1f}s")
 
+            # Save checkpoint every save_interval (default 200)
             if step % args.save_interval == 0 or step == args.steps:
                 ckpt_path = os.path.join(ckpt_dir, f"checkpoint_step_{step}.pt")
                 torch.save({
@@ -216,7 +225,7 @@ if __name__ == "__main__":
     parser.add_argument("--seq_len", type=int, default=512)
     parser.add_argument("--lr", type=float, default=1.5e-3)
     parser.add_argument("--eval_interval", type=int, default=100)
-    parser.add_argument("--save_interval", type=int, default=1000)
+    parser.add_argument("--save_interval", type=int, default=200)
     parser.add_argument("--resume_from", type=str, default=None, help="Path to checkpoint to resume training from")
     parser.add_argument("--output_dir", type=str, default="checkpoints")
     args = parser.parse_args()
