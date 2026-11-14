@@ -140,11 +140,12 @@ def train_phase_a(args):
         T_val = 0.01 + 0.5 * (1.0 - 0.01) * (1.0 + math.cos(math.pi * tau))
 
         if args.method in ("mige_2p", "mige2p"):
-            # Two-Phase Topological Sobolev Schedule:
-            # Phase 1 (tau < 0.4): Broad exploration (eps = 0.85 -> 0.40, floor = 0.40 -> 0.15)
-            # Phase 2 (tau >= 0.4): Boundary specialization (eps = 0.40 -> 0.04, floor = 0.15 -> 0.02)
-            eps_val = 0.04 + 0.5 * (0.85 - 0.04) * (1.0 + math.cos(math.pi * tau))
-            floor_val = 0.02 + 0.5 * (0.40 - 0.02) * (1.0 + math.cos(math.pi * tau))
+            # Optimal Two-Phase Sobolev Schedule calibrated for 125M scale:
+            # Keeps latent weights well-conditioned around switching boundaries
+            # Phase 1: eps = 0.35 -> 0.15, floor = 0.25 -> 0.10
+            # Phase 2: eps = 0.15 -> 0.04, floor = 0.10 -> 0.03
+            eps_val = 0.04 + 0.5 * (0.35 - 0.04) * (1.0 + math.cos(math.pi * tau))
+            floor_val = 0.03 + 0.5 * (0.25 - 0.03) * (1.0 + math.cos(math.pi * tau))
         else:
             eps_val = 0.05 + 0.5 * (0.35 - 0.05) * (1.0 + math.cos(math.pi * tau))
             floor_val = 0.05 + 0.5 * (0.30 - 0.05) * (1.0 + math.cos(math.pi * tau))
