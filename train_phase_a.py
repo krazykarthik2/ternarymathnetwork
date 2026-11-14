@@ -136,13 +136,22 @@ def train_phase_a(args):
         x, y = next(train_iter)
         x, y = x.to(device), y.to(device)
 
-        T_val = 0.01 + 0.5 * (1.0 - 0.01) * (1.0 + math.cos(math.pi * step / args.steps))
-        eps_val = 0.05 + 0.5 * (0.35 - 0.05) * (1.0 + math.cos(math.pi * step / args.steps))
-        floor_val = 0.05 + 0.5 * (0.30 - 0.05) * (1.0 + math.cos(math.pi * step / args.steps))
+        tau = step / float(args.steps)
+        T_val = 0.01 + 0.5 * (1.0 - 0.01) * (1.0 + math.cos(math.pi * tau))
 
-        if args.method == "mige":
+        if args.method in ("mige_2p", "mige2p"):
+            # Two-Phase Topological Sobolev Schedule:
+            # Phase 1 (tau < 0.4): Broad exploration (eps = 0.85 -> 0.40, floor = 0.40 -> 0.15)
+            # Phase 2 (tau >= 0.4): Boundary specialization (eps = 0.40 -> 0.04, floor = 0.15 -> 0.02)
+            eps_val = 0.04 + 0.5 * (0.85 - 0.04) * (1.0 + math.cos(math.pi * tau))
+            floor_val = 0.02 + 0.5 * (0.40 - 0.02) * (1.0 + math.cos(math.pi * tau))
+        else:
+            eps_val = 0.05 + 0.5 * (0.35 - 0.05) * (1.0 + math.cos(math.pi * tau))
+            floor_val = 0.05 + 0.5 * (0.30 - 0.05) * (1.0 + math.cos(math.pi * tau))
+
+        if args.method in ("mige", "mige_2p", "mige2p"):
             for m in model.modules():
-                if hasattr(m, "method") and m.method == "mige":
+                if hasattr(m, "floor_grad"):
                     m.floor_grad = floor_val
 
         optimizer.zero_grad()
@@ -208,7 +217,7 @@ def train_phase_a(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--scale", type=str, default="125M", choices=["125M", "350M"])
-    parser.add_argument("--method", type=str, default="mige", choices=["ste", "temp_anneal", "mige"])
+    parser.add_argument("--method", type=str, default="mige_2p", choices=["ste", "temp_anneal", "mige", "mige_2p", "mige2p"])
     parser.add_argument("--dataset", type=str, default="HuggingFaceFW/fineweb-edu")
     parser.add_argument("--subset", type=str, default="sample-10BT")
     parser.add_argument("--steps", type=int, default=10000)

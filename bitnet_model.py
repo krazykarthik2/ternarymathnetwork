@@ -34,6 +34,7 @@ class BitLinear(nn.Module):
             self.bias = nn.Parameter(torch.zeros(out_features))
         else:
             self.register_parameter('bias', None)
+        self.floor_grad = 0.05
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -47,8 +48,8 @@ class BitLinear(nn.Module):
             w_q = ste_quantize(w_norm, threshold=0.5, clip_val=1.0)
         elif self.method == "temp_anneal":
             w_q = temp_anneal_quantize(w_norm, T=T, threshold=0.5)
-        elif self.method == "mige":
-            w_q = mige_quantize(w_norm, epsilon=epsilon, threshold=0.5, floor_grad=0.02)
+        elif self.method in ("mige", "mige_2p", "mige2p"):
+            w_q = mige_quantize(w_norm, epsilon=epsilon, threshold=0.5, floor_grad=self.floor_grad)
         elif self.method == "discrete_eval":
             w_q = hard_ternary(w_norm, threshold=0.5)
         else:
