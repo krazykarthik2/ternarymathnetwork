@@ -1,13 +1,14 @@
 #!/bin/bash
 # ==============================================================================
 # GPU VM Master Launch Script: BitNet b1.58 Phase A & Phase B Benchmark
-# Supports: ste, temp_anneal, mige, mige2p, and eval
+# Supports: ste, temp_anneal, mige, mige2p, migev2, and eval
 #
 # Usage examples:
 #   ./run_gpu_vm.sh                     # Runs all methods starting from STE
 #   ./run_gpu_vm.sh temp_anneal         # Starts from Temperature Annealing
 #   ./run_gpu_vm.sh mige                # Starts from standard MIGE
 #   ./run_gpu_vm.sh mige2p              # Starts directly from MIGE-2P Two-Phase Sobolev
+#   ./run_gpu_vm.sh migev2              # Starts directly from MIGE-v2 (Gaussian Halo)
 #   ./run_gpu_vm.sh eval                # Only updates comparison charts & reports
 # ==============================================================================
 set -e
@@ -30,7 +31,7 @@ echo "=== Starting from stage: $START_STAGE ==="
 # 1. Control 1: STE Baseline
 # ------------------------------------------------------------------------------
 if [ "$START_STAGE" = "ste" ]; then
-    echo "--> [1/4] Starting Control 1: STE Baseline..."
+    echo "--> [1/5] Starting Control 1: STE Baseline..."
     python train_phase_a.py --scale 125M --method ste --dataset "$DATASET_NAME" --subset "$SUBSET_NAME" --steps $STEPS --batch_size $BATCH_SIZE --seq_len $SEQ_LEN
     START_STAGE="temp_anneal"
 fi
@@ -39,7 +40,7 @@ fi
 # 2. Control 2: Temperature Annealing
 # ------------------------------------------------------------------------------
 if [ "$START_STAGE" = "temp_anneal" ]; then
-    echo "--> [2/4] Starting Control 2: Temperature Annealing..."
+    echo "--> [2/5] Starting Control 2: Temperature Annealing..."
     python train_phase_a.py --scale 125M --method temp_anneal --dataset "$DATASET_NAME" --subset "$SUBSET_NAME" --steps $STEPS --batch_size $BATCH_SIZE --seq_len $SEQ_LEN
     START_STAGE="mige"
 fi
@@ -48,7 +49,7 @@ fi
 # 3. Experiment 1: Standard MIGE
 # ------------------------------------------------------------------------------
 if [ "$START_STAGE" = "mige" ]; then
-    echo "--> [3/4] Starting Experiment: MIGE (Standard)..."
+    echo "--> [3/5] Starting Experiment: MIGE (Standard)..."
     python train_phase_a.py --scale 125M --method mige --dataset "$DATASET_NAME" --subset "$SUBSET_NAME" --steps $STEPS --batch_size $BATCH_SIZE --seq_len $SEQ_LEN
     START_STAGE="mige2p"
 fi
@@ -57,8 +58,17 @@ fi
 # 4. Experiment 2: MIGE-2P (Two-Phase Topological Sobolev Schedule)
 # ------------------------------------------------------------------------------
 if [ "$START_STAGE" = "mige2p" ] || [ "$START_STAGE" = "mige_2p" ]; then
-    echo "--> [4/4] Starting Experiment: MIGE-2P (Two-Phase Topological Sobolev Schedule)..."
+    echo "--> [4/5] Starting Experiment: MIGE-2P (Two-Phase Topological Sobolev Schedule)..."
     python train_phase_a.py --scale 125M --method mige_2p --dataset "$DATASET_NAME" --subset "$SUBSET_NAME" --steps $STEPS --batch_size $BATCH_SIZE --seq_len $SEQ_LEN
+    START_STAGE="migev2"
+fi
+
+# ------------------------------------------------------------------------------
+# 5. Experiment 3: MIGE-v2 (Distance-Aware Gaussian Proximity Halo)
+# ------------------------------------------------------------------------------
+if [ "$START_STAGE" = "migev2" ] || [ "$START_STAGE" = "mige_v2" ]; then
+    echo "--> [5/5] Starting Experiment: MIGE-v2 (Distance-Aware Gaussian Proximity Halo)..."
+    python train_phase_a.py --scale 125M --method mige_v2 --dataset "$DATASET_NAME" --subset "$SUBSET_NAME" --steps $STEPS --batch_size $BATCH_SIZE --seq_len $SEQ_LEN
 fi
 
 echo "=== Step 2: Phase B & Multi-Model Comparative Evaluation ==="

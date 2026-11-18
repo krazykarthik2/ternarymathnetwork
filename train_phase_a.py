@@ -4,6 +4,7 @@ Supports:
 - Model specifications: BitNet-125M (12 layers, d=768, h=12) & BitNet-350M (24 layers, d=1024, h=16)
 - Resilient Streaming: Thread-safe generator without PyArrow GIL deadlock / thread-state collisions
 - Resume Capability: Automatically resume training from any step checkpoint
+- Optimization methods: ste, temp_anneal, mige, mige_2p, mige_v2 (Gaussian Halo)
 """
 import os
 import sys
@@ -68,7 +69,7 @@ class HFStreamDataset(IterableDataset):
                 y = torch.tensor(chunk[1:], dtype=torch.long)
                 yield x, y
 
-def get_model(scale="125M", method="mige", vocab_size=50257, max_seq_len=512):
+def get_model(scale="125M", method="mige_v2", vocab_size=50257, max_seq_len=512):
     if scale == "125M":
         return BitNet125M(vocab_size=vocab_size, dim=768, n_layers=12, n_heads=12,
                           hidden_dim=2048, max_seq_len=max_seq_len, method=method)
@@ -139,25 +140,38 @@ def train_phase_a(args):
         tau = step / float(args.steps)
         T_val = 0.01 + 0.5 * (1.0 - 0.01) * (1.0 + math.cos(math.pi * tau))
 
-        if args.method in ("mige_2p", "mige2p"):
-            # Optimal Two-Phase Sobolev Schedule calibrated for 125M scale:
-            # Keeps latent weights well-conditioned around switching boundaries
-            # Phase 1: eps = 0.35 -> 0.15, floor = 0.25 -> 0.10
-            # Phase 2: eps = 0.15 -> 0.04, floor = 0.10 -> 0.03
+        halo_alpha_val = 0.0
+        halo_beta_val = 5.0
+
+        if args.method in ("mige_v2", "migev2"):
+            # MIGE-v2: Distance-Aware Gaussian Proximity Halo Schedule
+            # Sobolev bandwidth ε: 0.30 -> 0.05
+            eps_val = 0.05 + 0.5 * (0.30 - 0.05) * (1.0 + math.cos(math.pi * tau))
+            # Minimal floor ρ: 0.15 -> 0.02
+            floor_val = 0.02 + 0.5 * (0.15 - 0.02) * (1.0 + math.cos(math.pi * tau))
+            # Halo amplitude α: increases smoothly from 0.05 -> 0.40 to sharpen boundary pull
+            halo_alpha_val = 0.05 + 0.35 * (1.0 - 0.5 * (1.0 + math.cos(math.pi * tau)))
+            # Halo sharpness β: expands from broad (2.0) to focused (20.0)
+            halo_beta_val = 2.0 + 18.0 * tau
+        elif args.method in ("mige_2p", "mige2p"):
             eps_val = 0.04 + 0.5 * (0.35 - 0.04) * (1.0 + math.cos(math.pi * tau))
             floor_val = 0.03 + 0.5 * (0.25 - 0.03) * (1.0 + math.cos(math.pi * tau))
         else:
             eps_val = 0.05 + 0.5 * (0.35 - 0.05) * (1.0 + math.cos(math.pi * tau))
             floor_val = 0.05 + 0.5 * (0.30 - 0.05) * (1.0 + math.cos(math.pi * tau))
 
-        if args.method in ("mige", "mige_2p", "mige2p"):
+        if args.method in ("mige", "mige_2p", "mige2p", "mige_v2", "migev2"):
             for m in model.modules():
                 if hasattr(m, "floor_grad"):
                     m.floor_grad = floor_val
+                if hasattr(m, "halo_alpha"):
+                    m.halo_alpha = halo_alpha_val
+                if hasattr(m, "halo_beta"):
+                    m.halo_beta = halo_beta_val
 
         optimizer.zero_grad()
         with torch.amp.autocast(device_type, enabled=(device.type == "cuda"), dtype=torch.bfloat16):
-            logits = model(x, T=T_val, epsilon=eps_val)
+            logits = model(x, T=T_val, epsilon=eps_val, halo_alpha=halo_alpha_val, halo_beta=halo_beta_val)
             loss = criterion(logits.view(-1, vocab_size), y.view(-1))
 
         scaler.scale(loss).backward()
@@ -218,7 +232,7 @@ def train_phase_a(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--scale", type=str, default="125M", choices=["125M", "350M"])
-    parser.add_argument("--method", type=str, default="mige_2p", choices=["ste", "temp_anneal", "mige", "mige_2p", "mige2p"])
+    parser.add_argument("--method", type=str, default="mige_v2", choices=["ste", "temp_anneal", "mige", "mige_2p", "mige2p", "mige_v2", "migev2"])
     parser.add_argument("--dataset", type=str, default="HuggingFaceFW/fineweb-edu")
     parser.add_argument("--subset", type=str, default="sample-10BT")
     parser.add_argument("--steps", type=int, default=10000)
