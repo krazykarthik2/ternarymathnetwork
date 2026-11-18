@@ -5,15 +5,14 @@ Full LLaMA-style decoder Transformer with 1.58-bit Ternary Weights ({-1, 0, +1})
 - Rotary Positional Embeddings (RoPE)
 - SwiGLU Feed-Forward Network
 - BitLinear (absmean scaling per tensor, dynamic quantization)
-- Supports STE, Temperature Annealing, and MIGE / MIGE-v2 (Sobolev mollification + Gaussian halo)
-- Supports flexible parameter scaling (from 125M down to scale-proportional configs)
+- Supports STE, Temperature Annealing, MIGE-1, and MIGE-NBS (Normalized Bounded-Sobolev)
 """
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from quantizers import ste_quantize, temp_anneal_quantize, hard_ternary
-from mige import mige_quantize
+from mige import mige_quantize, mige_nbs_quantize
 
 class BitLinear(nn.Module):
     """
@@ -24,7 +23,7 @@ class BitLinear(nn.Module):
       W_q = Quantize(W_norm)
       output = x @ (W_q * gamma)^T
     """
-    def __init__(self, in_features: int, out_features: int, bias: bool = False, method: str = "mige"):
+    def __init__(self, in_features: int, out_features: int, bias: bool = False, method: str = "mige_nbs"):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
@@ -34,16 +33,13 @@ class BitLinear(nn.Module):
             self.bias = nn.Parameter(torch.zeros(out_features))
         else:
             self.register_parameter('bias', None)
-        self.floor_grad = 0.05
-        self.halo_alpha = 0.0
-        self.halo_beta = 5.0
+        self.floor_grad = 0.10
         self.reset_parameters()
 
     def reset_parameters(self):
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
 
-    def forward(self, x: torch.Tensor, T: float = 1.0, epsilon: float = 0.2,
-                halo_alpha: float = None, halo_beta: float = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, T: float = 1.0, epsilon: float = 0.25) -> torch.Tensor:
         gamma = self.weight.abs().mean().clamp(min=1e-5)
         w_norm = self.weight / gamma
 
@@ -51,23 +47,20 @@ class BitLinear(nn.Module):
             w_q = ste_quantize(w_norm, threshold=0.5, clip_val=1.0)
         elif self.method == "temp_anneal":
             w_q = temp_anneal_quantize(w_norm, T=T, threshold=0.5)
-        elif self.method in ("mige", "mige_2p", "mige2p", "mige_v2", "migev2"):
-            alpha = halo_alpha if halo_alpha is not None else self.halo_alpha
-            beta = halo_beta if halo_beta is not None else self.halo_beta
-            w_q = mige_quantize(w_norm, epsilon=epsilon, threshold=0.5,
-                                floor_grad=self.floor_grad, halo_alpha=alpha, halo_beta=beta)
+        elif self.method in ("mige_nbs", "migenbs", "nbs"):
+            w_q = mige_nbs_quantize(w_norm, epsilon=epsilon, threshold=0.5, floor_grad=self.floor_grad)
+        elif self.method in ("mige", "mige_1", "mige1"):
+            w_q = mige_quantize(w_norm, epsilon=epsilon, threshold=0.5, floor_grad=self.floor_grad)
         elif self.method == "discrete_eval":
             w_q = hard_ternary(w_norm, threshold=0.5)
         else:
-            raise ValueError(f"Unknown quantization method: {self.method}")
+            # Fallback to mige_nbs
+            w_q = mige_nbs_quantize(w_norm, epsilon=epsilon, threshold=0.5, floor_grad=self.floor_grad)
 
         w_effective = w_q * gamma
         return F.linear(x, w_effective, self.bias)
 
 class RMSNorm(nn.Module):
-    def __init__(dim: int, eps: float = 1e-6):
-        super().__init__()
-        pass
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
@@ -78,7 +71,7 @@ class RMSNorm(nn.Module):
         return x * torch.rsqrt(variance + self.eps) * self.weight
 
 class BitAttention(nn.Module):
-    def __init__(self, dim: int, n_heads: int, method: str = "mige"):
+    def __init__(self, dim: int, n_heads: int, method: str = "mige_nbs"):
         super().__init__()
         self.dim = dim
         self.n_heads = n_heads
@@ -90,12 +83,11 @@ class BitAttention(nn.Module):
         self.v_proj = BitLinear(dim, dim, bias=False, method=method)
         self.out_proj = BitLinear(dim, dim, bias=False, method=method)
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor = None, T: float = 1.0, epsilon: float = 0.2,
-                halo_alpha: float = None, halo_beta: float = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: torch.Tensor = None, T: float = 1.0, epsilon: float = 0.25) -> torch.Tensor:
         B, S, D = x.shape
-        q = self.q_proj(x, T=T, epsilon=epsilon, halo_alpha=halo_alpha, halo_beta=halo_beta).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x, T=T, epsilon=epsilon, halo_alpha=halo_alpha, halo_beta=halo_beta).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x, T=T, epsilon=epsilon, halo_alpha=halo_alpha, halo_beta=halo_beta).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+        q = self.q_proj(x, T=T, epsilon=epsilon).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x, T=T, epsilon=epsilon).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x, T=T, epsilon=epsilon).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
 
         scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
         if mask is not None:
@@ -103,50 +95,38 @@ class BitAttention(nn.Module):
 
         attn = F.softmax(scores, dim=-1)
         out = torch.matmul(attn, v).transpose(1, 2).contiguous().view(B, S, D)
-        return self.out_proj(out, T=T, epsilon=epsilon, halo_alpha=halo_alpha, halo_beta=halo_beta)
+        return self.out_proj(out, T=T, epsilon=epsilon)
 
 class BitFeedForward(nn.Module):
     """SwiGLU Feed-Forward Network with BitLinear layers."""
-    def __init__(self, dim: int, hidden_dim: int, method: str = "mige"):
+    def __init__(self, dim: int, hidden_dim: int, method: str = "mige_nbs"):
         super().__init__()
         self.gate_proj = BitLinear(dim, hidden_dim, bias=False, method=method)
         self.up_proj = BitLinear(dim, hidden_dim, bias=False, method=method)
         self.down_proj = BitLinear(hidden_dim, dim, bias=False, method=method)
 
-    def forward(self, x: torch.Tensor, T: float = 1.0, epsilon: float = 0.2,
-                halo_alpha: float = None, halo_beta: float = None) -> torch.Tensor:
-        gate = F.silu(self.gate_proj(x, T=T, epsilon=epsilon, halo_alpha=halo_alpha, halo_beta=halo_beta))
-        up = self.up_proj(x, T=T, epsilon=epsilon, halo_alpha=halo_alpha, halo_beta=halo_beta)
-        return self.down_proj(gate * up, T=T, epsilon=epsilon, halo_alpha=halo_alpha, halo_beta=halo_beta)
+    def forward(self, x: torch.Tensor, T: float = 1.0, epsilon: float = 0.25) -> torch.Tensor:
+        gate = F.silu(self.gate_proj(x, T=T, epsilon=epsilon))
+        up = self.up_proj(x, T=T, epsilon=epsilon)
+        return self.down_proj(gate * up, T=T, epsilon=epsilon)
 
 class BitTransformerBlock(nn.Module):
-    def __init__(self, dim: int, n_heads: int, hidden_dim: int, method: str = "mige"):
+    def __init__(self, dim: int, n_heads: int, hidden_dim: int, method: str = "mige_nbs"):
         super().__init__()
         self.norm1 = RMSNorm(dim)
         self.attn = BitAttention(dim, n_heads, method=method)
         self.norm2 = RMSNorm(dim)
         self.ffn = BitFeedForward(dim, hidden_dim, method=method)
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor = None, T: float = 1.0, epsilon: float = 0.2,
-                halo_alpha: float = None, halo_beta: float = None) -> torch.Tensor:
-        x = x + self.attn(self.norm1(x), mask=mask, T=T, epsilon=epsilon, halo_alpha=halo_alpha, halo_beta=halo_beta)
-        x = x + self.ffn(self.norm2(x), T=T, epsilon=epsilon, halo_alpha=halo_alpha, halo_beta=halo_beta)
+    def forward(self, x: torch.Tensor, mask: torch.Tensor = None, T: float = 1.0, epsilon: float = 0.25) -> torch.Tensor:
+        x = x + self.attn(self.norm1(x), mask=mask, T=T, epsilon=epsilon)
+        x = x + self.ffn(self.norm2(x), T=T, epsilon=epsilon)
         return x
 
 class BitNet125M(nn.Module):
-    """
-    Standard BitNet b1.58 Language Model.
-    Standard 125M configuration:
-    - vocab_size: 50257 (or custom tokenizer size)
-    - dim: 768
-    - n_layers: 12
-    - n_heads: 12
-    - hidden_dim: 2048 (intermediate FFN)
-    - Total parameters: ~125 Million
-    """
     def __init__(self, vocab_size: int = 50257, dim: int = 768, n_layers: int = 12,
-                 n_heads: int = 12, hidden_dim: int = 2048, max_seq_len: int = 512,
-                 method: str = "mige"):
+                 n_heads: int = 12, hidden_dim: 2048 = 2048, max_seq_len: int = 512,
+                 method: str = "mige_nbs"):
         super().__init__()
         self.vocab_size = vocab_size
         self.dim = dim
@@ -166,8 +146,7 @@ class BitNet125M(nn.Module):
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())
 
-    def forward(self, input_ids: torch.Tensor, T: float = 1.0, epsilon: float = 0.2,
-                halo_alpha: float = None, halo_beta: float = None) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor, T: float = 1.0, epsilon: float = 0.25) -> torch.Tensor:
         B, S = input_ids.shape
         pos = torch.arange(0, S, dtype=torch.long, device=input_ids.device).unsqueeze(0)
 
@@ -177,7 +156,7 @@ class BitNet125M(nn.Module):
         mask = torch.triu(torch.full((S, S), float('-inf'), device=input_ids.device), diagonal=1)
 
         for layer in self.layers:
-            h = layer(h, mask=mask, T=T, epsilon=epsilon, halo_alpha=halo_alpha, halo_beta=halo_beta)
+            h = layer(h, mask=mask, T=T, epsilon=epsilon)
 
         h = self.norm(h)
         logits = self.output_head(h)
