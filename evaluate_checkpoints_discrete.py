@@ -2,14 +2,10 @@
 Standalone & Suite Evaluator for BitNet b1.58 Checkpoints.
 Strictly evaluates models under true hardware discrete ternary weights {-1, 0, +1}
 on held-out FineWeb-Edu tokens.
-Can be executed for:
-  1. The full benchmark suite across all methods: python evaluate_checkpoints_discrete.py
-  2. A specific checkpoint / method: python evaluate_checkpoints_discrete.py --checkpoint checkpoints/125M_mige_hc/checkpoint_step_10000.pt --name "MIGE-HC (Homotopy Sobolev, Step 10,000)"
 """
 import os
 import sys
 
-# Crucial for preventing PyGILState_Release / thread crashes on Linux exit
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import gc
@@ -25,10 +21,8 @@ from bitnet_model import BitNet125M
 from device_utils import get_device, get_device_info
 
 def fetch_held_out_tokens(tokenizer, seq_len=512, batch_size=16, num_batches=30):
-    """Fetches held-out validation tokens safely and cleans up dataset streaming handles."""
     print(f"Fetching {num_batches * batch_size * seq_len:,} held-out validation tokens...")
     ds = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
-    # Skip the first 100,000 samples to guarantee non-overlapping, strictly held-out evaluation
     ds_iter = iter(ds.skip(100000))
     batches = []
     token_buffer = []
@@ -55,7 +49,6 @@ def fetch_held_out_tokens(tokenizer, seq_len=512, batch_size=16, num_batches=30)
     return batches
 
 def evaluate_single_checkpoint(path, name, device, vocab_size, batches, seq_len=512):
-    """Evaluates a single checkpoint strictly on discrete hardware ternary projection {-1, 0, +1}."""
     if not os.path.exists(path):
         print(f"[-] Checkpoint not found: {path} (skipping)")
         return None
@@ -89,7 +82,6 @@ def evaluate_single_checkpoint(path, name, device, vocab_size, batches, seq_len=
     avg_loss = total_loss / total_tokens
     ppl = math.exp(min(avg_loss, 20.0))
 
-    # Weight distribution statistics
     weights = []
     for n, p in model.named_parameters():
         if 'weight' in n and ('proj' in n or 'w1' in n or 'w2' in n or 'w3' in n):
@@ -131,7 +123,6 @@ def main():
     vocab_size = tokenizer.vocab_size
     batches = fetch_held_out_tokens(tokenizer, seq_len=512, batch_size=16, num_batches=30)
 
-    # Load existing results to append/update
     results = {}
     if os.path.exists(args.eval_json):
         try:
@@ -141,18 +132,17 @@ def main():
             results = {}
 
     if args.checkpoint:
-        # Evaluate single target model
         name = args.name or os.path.basename(args.checkpoint)
         res = evaluate_single_checkpoint(args.checkpoint, name, device, vocab_size, batches)
         if res:
             results[name] = res
     else:
-        # Full benchmark suite
         models_to_test = {
-            "MIGE-HC (Homotopy Sobolev, Step 10,000)": "checkpoints/125M_mige_hc/checkpoint_step_10000.pt",
+            "MIGE-TA (Mollified Temp Anneal, Step 10,000)": "checkpoints/125M_mige_ta/checkpoint_step_10000.pt",
             "Temperature Annealing (Step 10,000)": "checkpoints/125M_temp_anneal/checkpoint_step_10000.pt",
             "MIGE (Adaptive Sobolev, Step 10,000)": "checkpoints/125M_mige/checkpoint_step_10000.pt",
             "STE Baseline (Step 10,000)": "checkpoints/125M_ste/checkpoint_step_10000.pt",
+            "MIGE-HC (Homotopy Sobolev, Step 10,000)": "checkpoints/125M_mige_hc/checkpoint_step_10000.pt",
             "TSGO (Ternary Swarm, Step 10,000)": "checkpoints/125M_tsgo/checkpoint_step_10000.pt",
             "MIGE-NBS (Normalized Bounded-Sobolev, Step 10,000)": "checkpoints/125M_mige_nbs/checkpoint_step_10000.pt",
         }
@@ -166,7 +156,6 @@ def main():
         json.dump(results, f, indent=2)
 
     print(f"\nSaved accurate evaluation results to {args.eval_json}")
-    # Force clean exit to avoid PyGILState crash from background streaming threads
     os._exit(0)
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@ BitNet b1.58 Multi-GPU / Distributed Pre-Training Engine (Phase A).
 Supports:
 - Model specifications: BitNet-125M (12 layers, d=768, h=12) & BitNet-350M (24 layers, d=1024, h=16)
 - High-Throughput Async Preload Pipeline
-- Optimization methods: ste, temp_anneal, mige_1, mige_nbs, tsgo, mige_hc (Homotopy Continuation Sobolev)
+- Optimization methods: ste, temp_anneal, mige_1, mige_nbs, tsgo, mige_hc, mige_ta (Mollified Temperature Annealing)
 """
 import os
 import sys
@@ -84,7 +84,7 @@ class AsyncTokenStreamer:
     def close(self):
         self.stop_event.set()
 
-def get_model(scale="125M", method="mige_hc", vocab_size=50257, max_seq_len=512):
+def get_model(scale="125M", method="mige_ta", vocab_size=50257, max_seq_len=512):
     if scale == "125M":
         return BitNet125M(vocab_size=vocab_size, dim=768, n_layers=12, n_heads=12,
                           hidden_dim=2048, max_seq_len=max_seq_len, method=method)
@@ -129,7 +129,6 @@ def train_phase_a(args):
         "discrete_loss": [], "discrete_ppl": [], "discretization_gap": []
     }
 
-    # Auto-resume from latest checkpoint if present
     resume_path = args.resume_from
     if not resume_path:
         for s in range(args.steps, 0, -100):
@@ -158,26 +157,20 @@ def train_phase_a(args):
     scaler = torch.amp.GradScaler(device_type, enabled=(device.type == "cuda"))
     start_time = time.time()
 
-    is_mige_hc = args.method in ("mige_hc", "homotopy", "hc")
-    # Switch step: 60% smooth homotopy, 40% discrete Sobolev transfer
-    switch_step = int(args.steps * args.hc_switch_ratio)
-
     try:
         for step in range(start_step, args.steps + 1):
             x, y = streamer.next_batch(device)
 
             tau = step / float(args.steps)
+            # Temperature cools smoothly from 1.0 down to 0.01
             T_val = 0.01 + 0.5 * (1.0 - 0.01) * (1.0 + math.cos(math.pi * tau))
             eps_val = 0.05 + 0.5 * (0.35 - 0.05) * (1.0 + math.cos(math.pi * tau))
-            floor_val = 0.05 + 0.5 * (0.30 - 0.05) * (1.0 + math.cos(math.pi * tau))
+            # Floor gradient cools from 0.20 down to 0.01 to let deep weights move early
+            floor_val = 0.01 + 0.5 * (0.20 - 0.01) * (1.0 + math.cos(math.pi * tau))
 
-            # Configure Homotopy Continuation state
-            if is_mige_hc:
-                in_discrete_phase = (step > switch_step)
-                for m in model.modules():
-                    if isinstance(m, BitLinear):
-                        m.is_discrete = in_discrete_phase
-                        m.floor_grad = floor_val
+            for m in model.modules():
+                if hasattr(m, "floor_grad"):
+                    m.floor_grad = floor_val
 
             optimizer.zero_grad()
             with torch.amp.autocast(device_type, enabled=(device.type == "cuda"), dtype=torch.bfloat16):
@@ -222,8 +215,7 @@ def train_phase_a(args):
                 metrics["discretization_gap"].append(gap_delta)
 
                 elapsed = time.time() - start_time
-                phase_label = " [DISCRETE]" if (is_mige_hc and step > switch_step) else " [SMOOTH]" if is_mige_hc else ""
-                print(f"Step {step:6d}/{args.steps}{phase_label} | Train PPL: {train_ppl_val:7.2f} | Discrete PPL: {disc_ppl:7.2f} | Gap (Delta): {gap_delta:+6.2f} | Time: {elapsed:.1f}s")
+                print(f"Step {step:6d}/{args.steps} | Train PPL: {train_ppl_val:7.2f} | Discrete PPL: {disc_ppl:7.2f} | Gap (Delta): {gap_delta:+6.2f} | T: {T_val:.4f} | Time: {elapsed:.1f}s")
 
                 if step % args.save_interval == 0 or step == args.steps:
                     ckpt_path = os.path.join(ckpt_dir, f"checkpoint_step_{step}.pt")
@@ -246,7 +238,7 @@ def train_phase_a(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--scale", type=str, default="125M", choices=["125M", "350M"])
-    parser.add_argument("--method", type=str, default="mige_hc", choices=["ste", "temp_anneal", "mige_1", "mige1", "mige", "mige_nbs", "migenbs", "nbs", "tsgo", "mige_hc", "homotopy", "hc"])
+    parser.add_argument("--method", type=str, default="mige_ta", choices=["ste", "temp_anneal", "mige_1", "mige1", "mige", "mige_nbs", "migenbs", "nbs", "tsgo", "mige_hc", "mige_ta", "migeta"])
     parser.add_argument("--dataset", type=str, default="HuggingFaceFW/fineweb-edu")
     parser.add_argument("--subset", type=str, default="sample-10BT")
     parser.add_argument("--steps", type=int, default=10000)
@@ -255,7 +247,6 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=1.5e-3)
     parser.add_argument("--eval_interval", type=int, default=100)
     parser.add_argument("--save_interval", type=int, default=1000)
-    parser.add_argument("--hc_switch_ratio", type=float, default=0.60, help="Fraction of steps in smooth phase before switching to hard discrete")
     parser.add_argument("--resume_from", type=str, default=None, help="Path to checkpoint to resume training from")
     parser.add_argument("--output_dir", type=str, default="checkpoints")
     args = parser.parse_args()
