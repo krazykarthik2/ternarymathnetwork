@@ -1,8 +1,11 @@
 """
-Evaluates all completed 10,000-step BitNet checkpoints strictly under exact
-hardware discrete integer weights snaps {-1, 0, +1} on held-out FineWeb-Edu tokens.
+Evaluates BitNet checkpoints strictly under exact hardware discrete integer weights snaps {-1, 0, +1}
+on held-out FineWeb-Edu tokens.
 """
 import os
+import sys
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import json
 import math
 import time
@@ -19,6 +22,26 @@ def evaluate_suite():
     print("RUNNING ACCURATE HARDWARE DISCRETE EVALUATION ON HELD-OUT TOKENS")
     print(f"Device: {get_device_info()['name']}")
     print("=" * 90)
+
+    models_to_test = {
+        "TSGO (Ternary Swarm, Step 10,000)": "checkpoints/125M_tsgo/checkpoint_step_10000.pt",
+        "Temperature Annealing (Step 10,000)": "checkpoints/125M_temp_anneal/checkpoint_step_10000.pt",
+        "MIGE (Adaptive Sobolev, Step 10,000)": "checkpoints/125M_mige/checkpoint_step_10000.pt",
+        "STE Baseline (Step 10,000)": "checkpoints/125M_ste/checkpoint_step_10000.pt",
+        "MIGE-NBS (Normalized Bounded-Sobolev, Step 10,000)": "checkpoints/125M_mige_nbs/checkpoint_step_10000.pt",
+    }
+
+    # Pre-check available models
+    available_models = {}
+    for name, path in models_to_test.items():
+        if os.path.exists(path):
+            available_models[name] = path
+        else:
+            print(f"[-] Checkpoint not found: {path} (skipping)")
+
+    if not available_models:
+        print("[!] No checkpoints found to evaluate!")
+        return
 
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
     vocab_size = tokenizer.vocab_size
@@ -51,14 +74,6 @@ def evaluate_suite():
 
     criterion = nn.CrossEntropyLoss()
     
-    models_to_test = {
-        "TSGO (Ternary Swarm, Step 10,000)": "checkpoints/125M_tsgo/checkpoint_step_10000.pt",
-        "Temperature Annealing (Step 10,000)": "checkpoints/125M_temp_anneal/checkpoint_step_10000.pt",
-        "MIGE (Adaptive Sobolev, Step 10,000)": "checkpoints/125M_mige/checkpoint_step_10000.pt",
-        "STE Baseline (Step 10,000)": "checkpoints/125M_ste/checkpoint_step_10000.pt",
-        "MIGE-NBS (Normalized Bounded-Sobolev, Step 10,000)": "checkpoints/125M_mige_nbs/checkpoint_step_10000.pt",
-    }
-    
     results = {}
     eval_json_path = "results/final_evaluation_results.json"
     if os.path.exists(eval_json_path):
@@ -68,10 +83,7 @@ def evaluate_suite():
             except Exception:
                 results = {}
 
-    for name, path in models_to_test.items():
-        if not os.path.exists(path):
-            print(f"[-] Checkpoint not found: {path} (skipping)")
-            continue
+    for name, path in available_models.items():
         print(f"\n--> Evaluating: {name} [{path}]...")
         t0 = time.time()
         model = BitNet125M(vocab_size=vocab_size, dim=768, n_layers=12, n_heads=12,
