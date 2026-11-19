@@ -5,7 +5,7 @@ Full LLaMA-style decoder Transformer with 1.58-bit Ternary Weights ({-1, 0, +1})
 - Rotary Positional Embeddings (RoPE)
 - SwiGLU Feed-Forward Network
 - BitLinear (absmean scaling per tensor, dynamic quantization)
-- Supports STE, Temperature Annealing, MIGE-1, MIGE-NBS, and TSGO (Ternary Swarm-Guided Optimization)
+- Supports STE, Temperature Annealing, MIGE-1, MIGE-NBS, TSGO, and MIGE-HC (Homotopy Continuation)
 """
 import math
 import torch
@@ -13,6 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from quantizers import ste_quantize, temp_anneal_quantize, hard_ternary
 from mige import mige1_quantize, mige_nbs_quantize, tsgo_quantize
+from homotopy_mige import homotopy_sobolev_quantize
 
 class BitLinear(nn.Module):
     """
@@ -23,7 +24,7 @@ class BitLinear(nn.Module):
       W_q = Quantize(W_norm)
       output = x @ (W_q * gamma)^T
     """
-    def __init__(self, in_features: int, out_features: int, bias: bool = False, method: str = "tsgo"):
+    def __init__(self, in_features: int, out_features: int, bias: bool = False, method: str = "mige_hc"):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
@@ -34,6 +35,7 @@ class BitLinear(nn.Module):
         else:
             self.register_parameter('bias', None)
         self.floor_grad = 0.05
+        self.is_discrete = False
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -43,7 +45,11 @@ class BitLinear(nn.Module):
         gamma = self.weight.abs().mean().clamp(min=1e-5)
         w_norm = self.weight / gamma
 
-        if self.method == "ste":
+        if self.method in ("mige_hc", "homotopy", "hc"):
+            w_q = homotopy_sobolev_quantize(w_norm, T=T, epsilon=epsilon,
+                                           is_discrete=self.is_discrete,
+                                           threshold=0.5, floor_grad=self.floor_grad)
+        elif self.method == "ste":
             w_q = ste_quantize(w_norm, threshold=0.5, clip_val=1.0)
         elif self.method == "temp_anneal":
             w_q = temp_anneal_quantize(w_norm, T=T, threshold=0.5)
@@ -56,7 +62,7 @@ class BitLinear(nn.Module):
         elif self.method == "discrete_eval":
             w_q = hard_ternary(w_norm, threshold=0.5)
         else:
-            w_q = tsgo_quantize(w_norm, epsilon=epsilon, threshold=0.5, floor_grad=self.floor_grad)
+            w_q = hard_ternary(w_norm, threshold=0.5)
 
         w_effective = w_q * gamma
         return F.linear(x, w_effective, self.bias)
@@ -72,7 +78,7 @@ class RMSNorm(nn.Module):
         return x * torch.rsqrt(variance + self.eps) * self.weight
 
 class BitAttention(nn.Module):
-    def __init__(self, dim: int, n_heads: int, method: str = "tsgo"):
+    def __init__(self, dim: int, n_heads: int, method: str = "mige_hc"):
         super().__init__()
         self.dim = dim
         self.n_heads = n_heads
@@ -100,7 +106,7 @@ class BitAttention(nn.Module):
 
 class BitFeedForward(nn.Module):
     """SwiGLU Feed-Forward Network with BitLinear layers."""
-    def __init__(self, dim: int, hidden_dim: int, method: str = "tsgo"):
+    def __init__(self, dim: int, hidden_dim: int, method: str = "mige_hc"):
         super().__init__()
         self.gate_proj = BitLinear(dim, hidden_dim, bias=False, method=method)
         self.up_proj = BitLinear(dim, hidden_dim, bias=False, method=method)
@@ -112,7 +118,7 @@ class BitFeedForward(nn.Module):
         return self.down_proj(gate * up, T=T, epsilon=epsilon)
 
 class BitTransformerBlock(nn.Module):
-    def __init__(self, dim: int, n_heads: int, hidden_dim: int, method: str = "tsgo"):
+    def __init__(self, dim: int, n_heads: int, hidden_dim: int, method: str = "mige_hc"):
         super().__init__()
         self.norm1 = RMSNorm(dim)
         self.attn = BitAttention(dim, n_heads, method=method)
@@ -127,7 +133,7 @@ class BitTransformerBlock(nn.Module):
 class BitNet125M(nn.Module):
     def __init__(self, vocab_size: int = 50257, dim: int = 768, n_layers: int = 12,
                  n_heads: int = 12, hidden_dim: int = 2048, max_seq_len: int = 512,
-                 method: str = "tsgo"):
+                 method: str = "mige_hc"):
         super().__init__()
         self.vocab_size = vocab_size
         self.dim = dim

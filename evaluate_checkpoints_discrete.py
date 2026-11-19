@@ -24,14 +24,14 @@ def evaluate_suite():
     print("=" * 90)
 
     models_to_test = {
-        "TSGO (Ternary Swarm, Step 10,000)": "checkpoints/125M_tsgo/checkpoint_step_10000.pt",
+        "MIGE-HC (Homotopy Sobolev, Step 10,000)": "checkpoints/125M_mige_hc/checkpoint_step_10000.pt",
         "Temperature Annealing (Step 10,000)": "checkpoints/125M_temp_anneal/checkpoint_step_10000.pt",
         "MIGE (Adaptive Sobolev, Step 10,000)": "checkpoints/125M_mige/checkpoint_step_10000.pt",
         "STE Baseline (Step 10,000)": "checkpoints/125M_ste/checkpoint_step_10000.pt",
+        "TSGO (Ternary Swarm, Step 10,000)": "checkpoints/125M_tsgo/checkpoint_step_10000.pt",
         "MIGE-NBS (Normalized Bounded-Sobolev, Step 10,000)": "checkpoints/125M_mige_nbs/checkpoint_step_10000.pt",
     }
 
-    # Pre-check available models
     available_models = {}
     for name, path in models_to_test.items():
         if os.path.exists(path):

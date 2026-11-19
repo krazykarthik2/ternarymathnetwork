@@ -1,19 +1,18 @@
 #!/bin/bash
 # ==============================================================================
 # GPU VM Master Launch Script: BitNet b1.58 Phase A & Phase B Benchmark
-# Supports: tsgo, mige_nbs, mige_1, ste, temp_anneal, eval
+# Supports: mige_hc, tsgo, mige_nbs, mige_1, ste, temp_anneal, eval
 #
 # Usage examples:
-#   ./run_gpu_vm.sh tsgo                # Starts TSGO (Ternary Swarm-Guided Optimization)
-#   ./run_gpu_vm.sh mige_nbs            # Starts from Normalized Bounded-Sobolev (MIGE-NBS)
-#   ./run_gpu_vm.sh ste                 # Starts from STE Baseline
-#   ./run_gpu_vm.sh temp_anneal         # Starts from Temperature Annealing
-#   ./run_gpu_vm.sh mige                # Starts from standard MIGE-1
+#   ./run_gpu_vm.sh mige_hc             # Starts MIGE-HC (Homotopy Continuation Sobolev)
+#   ./run_gpu_vm.sh tsgo                # Starts TSGO
+#   ./run_gpu_vm.sh temp_anneal         # Starts Temperature Annealing
+#   ./run_gpu_vm.sh mige                # Starts standard MIGE-1
 #   ./run_gpu_vm.sh eval                # Only runs held-out evaluation suite
 # ==============================================================================
 set -e
 
-START_STAGE="${1:-tsgo}"
+START_STAGE="${1:-mige_hc}"
 
 echo "=== Step 1: Verifying GPU & Python Environment ==="
 python -c "import torch; print('CUDA Available:', torch.cuda.is_available(), '| Device Count:', torch.cuda.device_count(), '| Name:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'None')"
@@ -28,43 +27,34 @@ echo "=== Target: $DATASET_NAME (subset: $SUBSET_NAME) | Target Steps: $STEPS ==
 echo "=== Starting from stage: $START_STAGE ==="
 
 # ------------------------------------------------------------------------------
-# 1. Primary Target: TSGO (Ternary Swarm-Guided Optimization)
+# 1. Primary Target: MIGE-HC (Homotopy Continuation Sobolev)
+# ------------------------------------------------------------------------------
+if [ "$START_STAGE" = "mige_hc" ] || [ "$START_STAGE" = "homotopy" ] || [ "$START_STAGE" = "hc" ]; then
+    echo "--> [TARGET] Starting Experiment: MIGE-HC (Homotopy Continuation Sobolev)..."
+    python train_phase_a.py --scale 125M --method mige_hc --dataset "$DATASET_NAME" --subset "$SUBSET_NAME" --steps $STEPS --batch_size $BATCH_SIZE --seq_len $SEQ_LEN --hc_switch_ratio 0.60
+    START_STAGE="eval"
+fi
+
+# ------------------------------------------------------------------------------
+# 2. Control: TSGO
 # ------------------------------------------------------------------------------
 if [ "$START_STAGE" = "tsgo" ] || [ "$START_STAGE" = "swarm" ]; then
-    echo "--> [TARGET] Starting Experiment: TSGO (Ternary Swarm-Guided Optimization)..."
+    echo "--> Starting Experiment: TSGO..."
     python train_phase_a.py --scale 125M --method tsgo --dataset "$DATASET_NAME" --subset "$SUBSET_NAME" --steps $STEPS --batch_size $BATCH_SIZE --seq_len $SEQ_LEN
     START_STAGE="eval"
 fi
 
 # ------------------------------------------------------------------------------
-# 2. Control: MIGE-NBS (Normalized Bounded-Sobolev)
+# 3. Control: Temperature Annealing
 # ------------------------------------------------------------------------------
-if [ "$START_STAGE" = "mige_nbs" ] || [ "$START_STAGE" = "migenbs" ] || [ "$START_STAGE" = "nbs" ]; then
-    echo "--> Starting Experiment: MIGE-NBS (Normalized Bounded-Sobolev)..."
-    python train_phase_a.py --scale 125M --method mige_nbs --dataset "$DATASET_NAME" --subset "$SUBSET_NAME" --steps $STEPS --batch_size $BATCH_SIZE --seq_len $SEQ_LEN
+if [ "$START_STAGE" = "temp_anneal" ]; then
+    echo "--> Starting Control: Temperature Annealing..."
+    python train_phase_a.py --scale 125M --method temp_anneal --dataset "$DATASET_NAME" --subset "$SUBSET_NAME" --steps $STEPS --batch_size $BATCH_SIZE --seq_len $SEQ_LEN
     START_STAGE="eval"
 fi
 
 # ------------------------------------------------------------------------------
-# 3. Control: STE Baseline
-# ------------------------------------------------------------------------------
-if [ "$START_STAGE" = "ste" ]; then
-    echo "--> Starting Control 1: STE Baseline..."
-    python train_phase_a.py --scale 125M --method ste --dataset "$DATASET_NAME" --subset "$SUBSET_NAME" --steps $STEPS --batch_size $BATCH_SIZE --seq_len $SEQ_LEN
-    START_STAGE="temp_anneal"
-fi
-
-# ------------------------------------------------------------------------------
-# 4. Control: Temperature Annealing
-# ------------------------------------------------------------------------------
-if [ "$START_STAGE" = "temp_anneal" ]; then
-    echo "--> Starting Control 2: Temperature Annealing..."
-    python train_phase_a.py --scale 125M --method temp_anneal --dataset "$DATASET_NAME" --subset "$SUBSET_NAME" --steps $STEPS --batch_size $BATCH_SIZE --seq_len $SEQ_LEN
-    START_STAGE="mige"
-fi
-
-# ------------------------------------------------------------------------------
-# 5. Control: Standard MIGE-1
+# 4. Control: Standard MIGE-1
 # ------------------------------------------------------------------------------
 if [ "$START_STAGE" = "mige" ] || [ "$START_STAGE" = "mige_1" ]; then
     echo "--> Starting Experiment: MIGE-1 (Adaptive Sobolev)..."
@@ -73,7 +63,7 @@ if [ "$START_STAGE" = "mige" ] || [ "$START_STAGE" = "mige_1" ]; then
 fi
 
 # ------------------------------------------------------------------------------
-# 6. Held-Out Evaluation & Comparison
+# 5. Held-Out Evaluation & Comparison
 # ------------------------------------------------------------------------------
 echo "=== Step 2: Running Evaluation Suite on Held-Out Tokens ==="
 python evaluate_checkpoints_discrete.py
