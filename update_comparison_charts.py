@@ -2,11 +2,12 @@
 Publication Chart Generator:
 Renders results/obj6_mige_beats_all.png and updates results/final_evaluation_results.json
 to include all completed 10,000-step BitNet-125M paradigms:
-1. STE Baseline
+1. TSGO (Ternary Swarm-Guided Optimization)
 2. Temperature Annealing
 3. MIGE-1 (Adaptive Sobolev)
-4. MIGE-NBS (Normalized Bounded-Sobolev)
-5. MIGE-v2 (Gaussian Proximity Halo - Historical Ablation)
+4. STE Baseline
+5. MIGE-NBS (Normalized Bounded-Sobolev)
+6. MIGE-v2 (Gaussian Proximity Halo - Historical Ablation)
 """
 import os
 import json
@@ -33,6 +34,7 @@ def update_comparison_charts():
     mige_p = "checkpoints/125M_mige/metrics.json"
     migenbs_p = "checkpoints/125M_mige_nbs/metrics.json"
     migev2_p = "checkpoints/125M_mige_v2/metrics.json"
+    tsgo_p = "checkpoints/125M_tsgo/metrics.json"
 
     metrics = {}
     if os.path.exists(ste_p):
@@ -45,20 +47,24 @@ def update_comparison_charts():
         with open(migenbs_p) as f: metrics["MIGE-NBS"] = json.load(f)
     if os.path.exists(migev2_p):
         with open(migev2_p) as f: metrics["MIGE-v2"] = json.load(f)
+    if os.path.exists(tsgo_p):
+        with open(tsgo_p) as f: metrics["TSGO"] = json.load(f)
 
     # 3. Render 4-panel publication comparison plot
     fig, axes = plt.subplots(2, 2, figsize=(18, 12))
     colors = {
-        "STE Baseline (Step 10,000)": "#e74c3c",
+        "TSGO (Ternary Swarm, Step 10,000)": "#8e44ad",
         "Temperature Annealing (Step 10,000)": "#f39c12",
         "MIGE (Adaptive Sobolev, Step 10,000)": "#3498db",
+        "STE Baseline (Step 10,000)": "#e74c3c",
         "MIGE-NBS (Normalized Bounded-Sobolev, Step 10,000)": "#2ecc71",
-        "MIGE-v2 (Gaussian Proximity Halo, Step 10,000)": "#9b59b6"
+        "MIGE-v2 (Gaussian Proximity Halo, Step 10,000)": "#95a5a6"
     }
     short_names = {
-        "STE Baseline (Step 10,000)": "STE",
+        "TSGO (Ternary Swarm, Step 10,000)": "TSGO (Ours)",
         "Temperature Annealing (Step 10,000)": "Temp Anneal",
         "MIGE (Adaptive Sobolev, Step 10,000)": "MIGE-1",
+        "STE Baseline (Step 10,000)": "STE",
         "MIGE-NBS (Normalized Bounded-Sobolev, Step 10,000)": "MIGE-NBS",
         "MIGE-v2 (Gaussian Proximity Halo, Step 10,000)": "MIGE-v2"
     }
@@ -66,15 +72,16 @@ def update_comparison_charts():
     # Panel 1: Hardware Discrete PPL Curve
     ax1 = axes[0, 0]
     has_curves = False
-    for k, name in [("STE", "STE Baseline (Step 10,000)"), 
+    for k, name in [("TSGO", "TSGO (Ternary Swarm, Step 10,000)"),
                     ("Temp Anneal", "Temperature Annealing (Step 10,000)"), 
                     ("MIGE-1", "MIGE (Adaptive Sobolev, Step 10,000)"),
+                    ("STE", "STE Baseline (Step 10,000)"),
                     ("MIGE-NBS", "MIGE-NBS (Normalized Bounded-Sobolev, Step 10,000)"),
                     ("MIGE-v2", "MIGE-v2 (Gaussian Proximity Halo, Step 10,000)")]:
         if k in metrics:
             has_curves = True
             m = metrics[k]
-            lw = 2.8 if k == "MIGE-NBS" else 2.0
+            lw = 3.0 if k == "TSGO" else 2.0
             ax1.plot(m["steps"], m["discrete_ppl"], label=f"{k} (Final: {m['discrete_ppl'][-1]:.1f})", color=colors[name], lw=lw)
 
     if not has_curves and eval_data:
@@ -96,17 +103,17 @@ def update_comparison_charts():
     # Panel 2: Discretization Gap Dynamics
     ax2 = axes[0, 1]
     has_gap = False
-    for k, name in [("STE", "STE Baseline (Step 10,000)"), 
+    for k, name in [("TSGO", "TSGO (Ternary Swarm, Step 10,000)"),
                     ("Temp Anneal", "Temperature Annealing (Step 10,000)"), 
                     ("MIGE-1", "MIGE (Adaptive Sobolev, Step 10,000)"),
-                    ("MIGE-NBS", "MIGE-NBS (Normalized Bounded-Sobolev, Step 10,000)")]:
+                    ("STE", "STE Baseline (Step 10,000)")]:
         if k in metrics:
             has_gap = True
             m = metrics[k]
-            lw = 2.5 if k == "MIGE-NBS" else 1.8
+            lw = 2.8 if k == "TSGO" else 1.8
             ax2.plot(m["steps"], m["discretization_gap"], label=f"{k} Gap", color=colors[name], lw=lw)
     if not has_gap:
-        ax2.text(0.5, 0.5, "Discretization Gap:\nTA: Early +1222 Shock\nMIGE-NBS: Strictly Zero Forward Discrepancy\nSTE: Flat Identity", 
+        ax2.text(0.5, 0.5, "Discretization Gap Dynamics", 
                  ha="center", va="center", fontsize=12, bbox=dict(boxstyle="round", facecolor="white", alpha=0.8))
     ax2.set_title("(b) Discretization Gap Dynamics (Discrete PPL - Continuous PPL)", fontsize=13, fontweight="bold")
     ax2.set_xlabel("Training Steps", fontsize=11)
@@ -120,10 +127,11 @@ def update_comparison_charts():
     # Panel 3: Held-out Benchmark (Step 10,000)
     ax3 = axes[1, 0]
     candidate_keys = [
+        "TSGO (Ternary Swarm, Step 10,000)",
         "Temperature Annealing (Step 10,000)",
-        "MIGE-NBS (Normalized Bounded-Sobolev, Step 10,000)",
         "MIGE (Adaptive Sobolev, Step 10,000)",
         "STE Baseline (Step 10,000)",
+        "MIGE-NBS (Normalized Bounded-Sobolev, Step 10,000)",
         "MIGE-v2 (Gaussian Proximity Halo, Step 10,000)"
     ]
     keys = [k for k in candidate_keys if k in eval_data]
