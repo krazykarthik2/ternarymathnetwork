@@ -125,11 +125,11 @@ def run_production_laplacian_training(target_tokens=10_000_000_000, batch_size=2
     dataset = FastStreamingDataset("HuggingFaceFW/fineweb-edu", "sample-10BT", seq_len=seq_len)
     loader = DataLoader(
         dataset,
-        batch_size=batch_size,
-        num_workers=workers if torch.cuda.is_available() else 0,
+        batch_size=args.batch_size,
+        num_workers=args.workers if torch.cuda.is_available() else 0,
         pin_memory=torch.cuda.is_available(),
-        persistent_workers=(workers > 0 and torch.cuda.is_available()),
-        prefetch_factor=8 if (workers > 0 and torch.cuda.is_available()) else None
+        persistent_workers=(args.workers > 0 and torch.cuda.is_available()),
+        prefetch_factor=2 if (args.workers > 0 and torch.cuda.is_available()) else None
     )
 
     # Initialize Global Covariance and Laplacian Accumulators in GPU VRAM
@@ -209,8 +209,8 @@ def run_production_laplacian_training(target_tokens=10_000_000_000, batch_size=2
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Zero-Backprop Production Spectral-Laplacian BitNet")
     parser.add_argument("--tokens", type=int, default=10_000_000_000)
-    parser.add_argument("--batch_size", type=int, default=128)
-    parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--ridge", type=float, default=1e-4)
     parser.add_argument("--output", type=str, default="production_bitnet/production_laplacian_10bt.pt")
     args = parser.parse_args()
