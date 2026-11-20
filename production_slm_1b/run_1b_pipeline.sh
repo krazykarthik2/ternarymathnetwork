@@ -12,11 +12,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 detect_gpus() {
-    if ! command -v nvidia-smi &> /dev/null; then
-        NUM_GPUS=0
-        return
-    fi
-    NUM_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
+    # Check actual visible GPUs to PyTorch (respecting CUDA_VISIBLE_DEVICES or container isolation)
+    NUM_GPUS=$(python3 -c "import torch; print(torch.cuda.device_count() if torch.cuda.is_available() else 0)" 2>/dev/null || echo 0)
 }
 
 detect_gpus
@@ -27,17 +24,17 @@ SFT_STEPS="${2:-5000}"
 
 echo "=================================================================="
 echo " 1 Billion Parameter Production SLM Pipeline"
-echo " Detected GPUs              : $NUM_GPUS"
+echo " PyTorch Visible CUDA GPUs  : $NUM_GPUS"
 echo " Pre-training Target Tokens : $TOKENS (50 Billion Tokens)"
 echo " Dialogue Tuning Steps      : $SFT_STEPS (5,000 steps)"
 echo "=================================================================="
 
 # Determine launcher command
 if [ "$NUM_GPUS" -ge 2 ]; then
-    echo "--> [Multi-GPU] Scaling across 2x L40S GPUs using torchrun (Near 2x Linear Speedup)..."
-    LAUNCH_CMD="torchrun --standalone --nproc_per_node=2"
+    echo "--> [Multi-GPU] Scaling across $NUM_GPUS GPUs using torchrun (Near Linear Speedup)..."
+    LAUNCH_CMD="torchrun --standalone --nproc_per_node=$NUM_GPUS"
 elif [ "$NUM_GPUS" -eq 1 ]; then
-    echo "--> [Single-GPU] Running on 1x GPU..."
+    echo "--> [Single-GPU] Running on 1x visible L40S GPU..."
     LAUNCH_CMD="python3"
 else
     echo "--> [CPU fallback] Running on CPU..."
