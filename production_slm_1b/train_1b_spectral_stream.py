@@ -64,14 +64,14 @@ def run_1b_spectral_inversion(tokens=50_000_000_000, batch_size=128, seq_len=512
                               ridge=1e-4, ckpt_dir="checkpoints_1b_stream",
                               ckpt_interval_tokens=500_000_000, output_file="bitnet_1b_pretrained.pt"):
     # Check distributed environment (e.g. launched via torchrun)
-    is_distributed = int(os.environ.get("WORLD_SIZE", 1)) > 1
+    is_distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1
     if is_distributed:
-        dist.init_process_group(backend="nccl")
-        rank = dist.get_rank()
-        world_size = dist.get_world_size()
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         torch.cuda.set_device(local_rank)
         device = torch.device(f"cuda:{local_rank}")
+        dist.init_process_group(backend="nccl", device_id=torch.device(f"cuda:{local_rank}"))
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
     else:
         rank = 0
         world_size = 1

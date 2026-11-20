@@ -35,7 +35,7 @@ echo "=================================================================="
 # Determine launcher command
 if [ "$NUM_GPUS" -ge 2 ]; then
     echo "--> [Multi-GPU] Scaling across 2x L40S GPUs using torchrun (Near 2x Linear Speedup)..."
-    LAUNCH_CMD="torchrun --nproc_per_node=2"
+    LAUNCH_CMD="torchrun --standalone --nproc_per_node=2"
 elif [ "$NUM_GPUS" -eq 1 ]; then
     echo "--> [Single-GPU] Running on 1x GPU..."
     LAUNCH_CMD="python3"

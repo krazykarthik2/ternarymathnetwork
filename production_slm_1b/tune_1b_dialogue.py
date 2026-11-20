@@ -90,14 +90,14 @@ class DialogueDataset(IterableDataset):
 def run_dialogue_tuning(base_ckpt="production_slm_1b/bitnet_1b_pretrained.pt", steps=5000,
                         batch_size=16, lr=1e-4, ckpt_dir="checkpoints_1b_sft",
                         output_file="production_slm_1b/bitnet_1b_dialogue_chat.pt"):
-    is_distributed = int(os.environ.get("WORLD_SIZE", 1)) > 1
+    is_distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1
     if is_distributed:
-        dist.init_process_group(backend="nccl")
-        rank = dist.get_rank()
-        world_size = dist.get_world_size()
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         torch.cuda.set_device(local_rank)
         device = torch.device(f"cuda:{local_rank}")
+        dist.init_process_group(backend="nccl", device_id=torch.device(f"cuda:{local_rank}"))
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
     else:
         rank = 0
         world_size = 1
