@@ -27,7 +27,7 @@ select_idle_gpu() {
 select_idle_gpu
 
 TOKENS="${1:-10000000000}"   # 10 Billion Tokens by default
-BATCH_SIZE="${2:-256}"
+BATCH_SIZE="${2:-128}"        # 128 is rock-solid safe under 20GB VRAM
 WORKERS="${3:-8}"
 RIDGE="${4:-0.0001}"
 

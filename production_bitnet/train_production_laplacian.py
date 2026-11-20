@@ -160,9 +160,12 @@ def run_production_laplacian_training(target_tokens=10_000_000_000, batch_size=2
             cov_xx.addmm_(h_x.t(), h_x)
             cov_yx.addmm_(h_y.t(), h_x)
 
-            # Sample subset for Graph Laplacian calculation
+            # Sample subset for Graph Laplacian calculation (moved to CPU to avoid VRAM accumulation)
             if len(sample_pool) < 2048:
-                sample_pool.append(h_x[:64])
+                sample_pool.append(h_x[:64].detach().cpu())
+
+            # Free batch tensors immediately
+            del h_x, h_y, pos
 
         now = time.time()
         if now - last_report_time >= 10.0:
@@ -185,7 +188,7 @@ def run_production_laplacian_training(target_tokens=10_000_000_000, batch_size=2
 
     # Compute Graph Laplacian Regularizer from token manifold
     print("\n[Step 2] Computing Zelnik-Manor Graph Laplacian from token manifold...")
-    h_sample = torch.cat(sample_pool, dim=0)[:2048]
+    h_sample = torch.cat(sample_pool, dim=0)[:2048].to(device)
     l_feat = compute_zelnik_laplacian_regularizer(h_sample, k=12)
 
     # Solve weights in closed form
@@ -203,7 +206,7 @@ def run_production_laplacian_training(target_tokens=10_000_000_000, batch_size=2
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Zero-Backprop Production Spectral-Laplacian BitNet")
     parser.add_argument("--tokens", type=int, default=10_000_000_000)
-    parser.add_argument("--batch_size", type=int, default=256)
+    parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--ridge", type=float, default=1e-4)
     parser.add_argument("--output", type=str, default="production_bitnet/production_laplacian_10bt.pt")
