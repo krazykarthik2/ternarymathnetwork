@@ -116,25 +116,7 @@ def main():
     for layer in model.layers:
         layer.attn = FastFlashAttention(dim=768, n_heads=12, method="temp_anneal").to(device)
 
-    # 1. Analytical Hopfield Single-Shot Calculation
-    print("\n[Step 1] Fast Single-Shot Hopfield Weight Calculation...")
-    t0 = time.time()
-    sample_tokens = torch.randint(0, 50257, (16, args.seq_len), device=device)
-    model.calculate_all_weights_single_shot(sample_tokens)
-    print(f"--> Calculated weights in {(time.time() - t0)*1000:.2f} ms")
-
-    # Optional torch.compile for graph fusion
-    if args.compile and torch.cuda.is_available() and hasattr(torch, "compile"):
-        # We compile the FlashAttention submodule which holds all matmuls and SDPA
-        print("--> Compiling FastFlashAttention layers with torch.compile...")
-        for i, layer in enumerate(model.layers):
-            try:
-                layer.attn = torch.compile(layer.attn)
-            except Exception as e:
-                print(f"--> Layer {i} compile fallback: {e}")
-        print("--> Attention compilation ready!")
-
-    # Multi-worker asynchronous PyTorch DataLoader
+    # Multi-worker asynchronous PyTorch DataLoader streaming REAL Fineweb-Edu
     dataset = FastStreamingDataset("HuggingFaceFW/fineweb-edu", "sample-10BT", seq_len=args.seq_len)
     loader = DataLoader(
         dataset,
@@ -144,6 +126,24 @@ def main():
         persistent_workers=(args.workers > 0 and torch.cuda.is_available()),
         prefetch_factor=4 if (args.workers > 0 and torch.cuda.is_available()) else None
     )
+    data_iter = iter(loader)
+
+    # 1. Analytical Hopfield Single-Shot Calculation FROM REAL FINEWEB-EDU TOKENS
+    print("\n[Step 1] Streaming real HuggingFaceFW/fineweb-edu tokens to calculate analytical Hopfield weights...")
+    t0 = time.time()
+    accum_tokens = []
+    # Collect 128 batches of real Fineweb-Edu text (65,536 real tokens)
+    for _ in range(min(128, args.steps)):
+        try:
+            bx, _ = next(data_iter)
+            accum_tokens.append(bx)
+        except StopIteration:
+            break
+
+    real_data_tensor = torch.cat(accum_tokens, dim=0).to(device)
+    print(f"--> Accumulated {real_data_tensor.numel():,} real Fineweb-Edu tokens on {device} for covariance calculation.")
+    model.calculate_all_weights_single_shot(real_data_tensor)
+    print(f"--> Calculated exact Hopfield ternary weights from real text in {(time.time() - t0):.2f}s")
 
     # Fused AdamW optimizer (runs in native C++/CUDA kernel)
     supports_fused = "fused" in torch.optim.AdamW.__init__.__code__.co_varnames
@@ -160,6 +160,16 @@ def main():
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
     criterion = nn.CrossEntropyLoss()
+
+    # Optional torch.compile for graph fusion
+    if args.compile and torch.cuda.is_available() and hasattr(torch, "compile"):
+        print("--> Compiling FastFlashAttention layers with torch.compile...")
+        for i, layer in enumerate(model.layers):
+            try:
+                layer.attn = torch.compile(layer.attn)
+            except Exception as e:
+                print(f"--> Layer {i} compile fallback: {e}")
+        print("--> Attention compilation ready!")
 
     print(f"\n[Step 2] Executing optimized TA training for {args.steps} steps...")
     start_time = time.time()
