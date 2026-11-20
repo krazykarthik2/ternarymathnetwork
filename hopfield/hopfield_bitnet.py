@@ -119,7 +119,10 @@ class HopfieldBitLinear(nn.Module):
         gamma = self.weight.abs().mean().clamp(min=1e-5)
         w_norm = self.weight / gamma
 
-        if self.method in ("mige_ta", "migeta"):
+        if self.method in ("temp_anneal", "ta"):
+            from quantizers import temp_anneal_quantize
+            w_q = temp_anneal_quantize(w_norm, T=T, threshold=0.5)
+        elif self.method in ("mige_ta", "migeta"):
             w_q = mige_ta_quantize(w_norm, T=T, threshold=0.5, floor_grad=self.floor_grad)
         elif self.method == "ste":
             w_q = ste_quantize(w_norm, threshold=0.5, clip_val=1.0)
