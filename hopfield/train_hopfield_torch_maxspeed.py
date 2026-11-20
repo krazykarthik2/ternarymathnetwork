@@ -61,10 +61,12 @@ class FastFlashAttention(nn.Module):
 
 class FastStreamingDataset(IterableDataset):
     """High-throughput multi-worker streaming dataset for PyTorch DataLoader."""
-    def __init__(self, dataset_name, subset, seq_len=512):
+    def __init__(self, dataset_name, subset, seq_len=512, rank=0, world_size=1):
         self.dataset_name = dataset_name
         self.subset = subset
         self.seq_len = seq_len
+        self.rank = rank
+        self.world_size = world_size
 
     def __iter__(self):
         from datasets import load_dataset
@@ -77,12 +79,18 @@ class FastStreamingDataset(IterableDataset):
         else:
             ds = load_dataset(self.dataset_name, split="train", streaming=True)
 
+        # Calculate combined worker index across multi-GPU ranks
         if worker_info is not None:
-            # Shard across CPU worker cores
-            ds = ds.shard(num_shards=worker_info.num_workers, index=worker_info.id)
+            total_shards = self.world_size * worker_info.num_workers
+            shard_id = self.rank * worker_info.num_workers + worker_info.id
+        else:
+            total_shards = self.world_size
+            shard_id = self.rank
 
         token_buf = []
-        for item in ds:
+        for idx, item in enumerate(ds):
+            if total_shards > 1 and (idx % total_shards != shard_id):
+                continue
             text = item.get("text", "")
             if not text:
                 continue

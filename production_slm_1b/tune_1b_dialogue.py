@@ -3,6 +3,7 @@ production_slm_1b/tune_1b_dialogue.py
 
 Stage 2: Dialogue & Instruction Alignment for 1B BitNet SLM:
 - SFT with ChatML multi-turn conversational format.
+- Multi-GPU Distributed Data Parallel (DDP) & Single-GPU Compatible.
 - Automatic Checkpoint Recovery:
   * Saves optimizer state, scheduler (LR), step, and model weights every 500 steps.
   * Auto-resumes from latest checkpoint on failure.
@@ -17,6 +18,8 @@ import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, IterableDataset
 
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
@@ -47,9 +50,11 @@ def find_latest_sft_checkpoint(ckpt_dir: str):
 
 class DialogueDataset(IterableDataset):
     """Streams conversational multi-turn dialogues formatted in ChatML."""
-    def __init__(self, tokenizer, max_len=1024):
+    def __init__(self, tokenizer, max_len=1024, rank=0, world_size=1):
         self.tokenizer = tokenizer
         self.max_len = max_len
+        self.rank = rank
+        self.world_size = world_size
 
     def __iter__(self):
         from datasets import load_dataset
@@ -58,7 +63,10 @@ class DialogueDataset(IterableDataset):
         except Exception:
             ds = load_dataset("teknium/OpenHermes-2.5", split="train", streaming=True)
 
-        for item in ds:
+        for idx, item in enumerate(ds):
+            if self.world_size > 1 and (idx % self.world_size != self.rank):
+                continue
+
             messages = item.get("messages", [])
             if not messages:
                 prompt = item.get("conversations", [])
@@ -79,39 +87,68 @@ class DialogueDataset(IterableDataset):
                        torch.tensor(tokens[1:], dtype=torch.long))
 
 
-def run_dialogue_tuning(base_ckpt: str, steps: int = 5000, lr: float = 3e-4, batch_size: int = 16,
-                        ckpt_dir: str = "checkpoints_1b_sft", output_file: str = "bitnet_1b_dialogue_chat.pt"):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    os.makedirs(ckpt_dir, exist_ok=True)
+def run_dialogue_tuning(base_ckpt="production_slm_1b/bitnet_1b_pretrained.pt", steps=5000,
+                        batch_size=16, lr=1e-4, ckpt_dir="checkpoints_1b_sft",
+                        output_file="production_slm_1b/bitnet_1b_dialogue_chat.pt"):
+    is_distributed = int(os.environ.get("WORLD_SIZE", 1)) > 1
+    if is_distributed:
+        dist.init_process_group(backend="nccl")
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        rank = 0
+        world_size = 1
+        local_rank = 0
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    print("==================================================================")
-    print(f" 1B BitNet SLM Dialogue Instruction Tuning Engine")
-    print(f" Device          : {device}")
-    print(f" Target Steps    : {steps:,}")
-    print(f" Checkpoint Dir  : {ckpt_dir} (Auto-checkpointing & recovery enabled)")
-    print("==================================================================")
+    is_master = (rank == 0)
+
+    if is_master:
+        os.makedirs(ckpt_dir, exist_ok=True)
+        print("==================================================================")
+        print(f" Stage 2: 1B SLM Conversational Instruction Tuning (ChatML)")
+        print(f" Distributed Mode: {'ENABLED (' + str(world_size) + ' GPUs)' if is_distributed else 'SINGLE GPU'}")
+        print(f" Device          : {device} ({torch.cuda.get_device_name(local_rank) if torch.cuda.is_available() else 'CPU'})")
+        print(f" Total Steps     : {steps:,}")
+        print(f" Batch Size/GPU  : {batch_size} (Global Batch: {batch_size * world_size})")
+        print(f" Checkpoint Dir  : {ckpt_dir} (Auto-saving every 500 steps)")
+        print("==================================================================")
 
     model = ProductionBitNet1B(dim=2048, n_layers=24, n_heads=16, hidden_dim=5632).to(device)
 
-    start_step = 1
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.95), weight_decay=0.01)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps, eta_min=lr * 0.1)
+    # Optimizer & Scheduler
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps, eta_min=1e-5)
 
-    # Check for SFT resume checkpoint first
-    latest_sft = find_latest_sft_checkpoint(ckpt_dir)
-    if latest_sft and os.path.exists(latest_sft):
-        print(f"--> [Auto-Resume] Found previous SFT checkpoint: {latest_sft}")
-        sft_data = torch.load(latest_sft, map_location=device)
-        model.load_state_dict(sft_data["model_state_dict"])
-        optimizer.load_state_dict(sft_data["optimizer_state_dict"])
-        scheduler.load_state_dict(sft_data["scheduler_state_dict"])
-        start_step = sft_data["step"] + 1
-        print(f"--> [Auto-Resume] Successfully recovered at Step {start_step:,} / {steps:,} (LR: {optimizer.param_groups[0]['lr']:.2e})!")
+    start_step = 1
+
+    # Check for SFT Auto-Recovery
+    latest_sft_ckpt = find_latest_sft_checkpoint(ckpt_dir)
+    if latest_sft_ckpt and os.path.exists(latest_sft_ckpt):
+        if is_master:
+            print(f"--> [Auto-Resume] Found previous SFT checkpoint: {latest_sft_ckpt}")
+        ckpt = torch.load(latest_sft_ckpt, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        start_step = ckpt["step"] + 1
+        if is_master:
+            print(f"--> [Auto-Resume] Resuming SFT training from step {start_step}/{steps} (LR: {optimizer.param_groups[0]['lr']:.2e})!")
     elif os.path.exists(base_ckpt):
-        print(f"--> Loading pre-trained 1B foundation weights from: {base_ckpt}")
+        if is_master:
+            print(f"--> Loading pre-trained 1B foundation weights from: {base_ckpt}")
         ckpt = torch.load(base_ckpt, map_location=device)
         model.load_state_dict(ckpt, strict=False)
-        print("--> Base foundation model loaded successfully!")
+        if is_master:
+            print("--> Base foundation model loaded successfully!")
+
+    if is_distributed:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
+
+    raw_model = model.module if is_distributed else model
 
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
@@ -126,7 +163,7 @@ def run_dialogue_tuning(base_ckpt: str, steps: int = 5000, lr: float = 3e-4, bat
             by.append(pad_y)
         return torch.stack(bx), torch.stack(by)
 
-    dataset = DialogueDataset(tokenizer, max_len=512)
+    dataset = DialogueDataset(tokenizer, max_len=512, rank=rank, world_size=world_size)
     loader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn)
 
     criterion = nn.CrossEntropyLoss(ignore_index=-100)
@@ -137,7 +174,8 @@ def run_dialogue_tuning(base_ckpt: str, steps: int = 5000, lr: float = 3e-4, bat
     t0 = time.time()
     data_iter = iter(loader)
 
-    print("\n--> Starting Dialogue SFT Optimization...")
+    if is_master:
+        print("\n--> Starting Dialogue SFT Optimization...")
     for step in range(start_step, steps + 1):
         try:
             bx, by = next(data_iter)
@@ -151,7 +189,7 @@ def run_dialogue_tuning(base_ckpt: str, steps: int = 5000, lr: float = 3e-4, bat
         optimizer.zero_grad(set_to_none=True)
         with torch.amp.autocast('cuda', enabled=use_amp, dtype=dtype):
             logits = model(x)
-            loss = criterion(logits.view(-1, model.vocab_size), y.view(-1))
+            loss = criterion(logits.view(-1, raw_model.vocab_size), y.view(-1))
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -160,26 +198,32 @@ def run_dialogue_tuning(base_ckpt: str, steps: int = 5000, lr: float = 3e-4, bat
         scaler.update()
         scheduler.step()
 
-        if step % 50 == 0 or step == start_step or step == steps:
+        if (step % 50 == 0 or step == start_step or step == steps) and is_master:
             ppl = math.exp(min(loss.item(), 20.0))
             cur_lr = optimizer.param_groups[0]["lr"]
             print(f"SFT Step {step:05d}/{steps:05d} | Chat Loss: {loss.item():.4f} | PPL: {ppl:.2f} | LR: {cur_lr:.2e} | Elapsed: {(time.time() - t0)/60:.1f}m")
 
         # Auto-Checkpointing every 500 steps
         if step % 500 == 0 or step == steps:
-            ckpt_path = os.path.join(ckpt_dir, f"sft_ckpt_step_{step}.pt")
-            torch.save({
-                "step": step,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": scheduler.state_dict(),
-                "loss": loss.item()
-            }, ckpt_path)
-            print(f"--> [Checkpoint] Saved SFT step {step} to: {ckpt_path}")
-            cleanup_old_sft_checkpoints(ckpt_dir, keep_latest=1)
+            if is_master:
+                ckpt_path = os.path.join(ckpt_dir, f"sft_ckpt_step_{step}.pt")
+                torch.save({
+                    "step": step,
+                    "model_state_dict": raw_model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "loss": loss.item()
+                }, ckpt_path)
+                print(f"--> [Checkpoint] Saved SFT step {step} to: {ckpt_path}")
+                cleanup_old_sft_checkpoints(ckpt_dir, keep_latest=1)
 
-    torch.save(model.state_dict(), output_file)
-    print(f"\n--> Dialogue tuning finished! Saved final assistant SLM to: {output_file}")
+    if is_master:
+        torch.save(raw_model.state_dict(), output_file)
+        print(f"\n--> Dialogue tuning finished! Saved final assistant SLM to: {output_file}")
+
+    if is_distributed:
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

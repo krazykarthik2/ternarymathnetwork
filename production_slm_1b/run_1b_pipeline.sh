@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Master Pipeline: 1 Billion Parameter Production SLM (50 Billion Tokens)
-# Stage 1: 50BT High-Volume Pre-training with Auto-Checkpointing & Recovery (~12.6 hrs)
-# Stage 2: SFT / Dialogue Alignment on Conversational ChatML with Auto-Recovery (~1.2 hrs)
+# Multi-GPU Auto-Detection: Automatically runs across 2x L40S GPUs via torchrun
+# Stage 1: 50BT High-Volume Pre-training with Auto-Checkpointing & Recovery (~6.3 hrs on 2x L40S)
+# Stage 2: SFT / Dialogue Alignment on Conversational ChatML with Auto-Recovery (~40 mins on 2x L40S)
 # Stage 3: Bit-pack into 260MB edge binary for instant local CPU chat
 # ==============================================================================
 set -e
@@ -10,22 +11,15 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-select_idle_gpu() {
+detect_gpus() {
     if ! command -v nvidia-smi &> /dev/null; then
-        export CUDA_VISIBLE_DEVICES=0
+        NUM_GPUS=0
         return
     fi
-    BEST_GPU=$(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits | sort -k2 -n | head -n 1 | awk -F',' '{print $1}' | tr -d ' ')
-    USED_MEM=$(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits | sort -k2 -n | head -n 1 | awk -F',' '{print $2}' | tr -d ' ')
-    if [ -n "$BEST_GPU" ]; then
-        echo "--> Selected idle GPU index: $BEST_GPU (Current memory used: ${USED_MEM} MiB)"
-        export CUDA_VISIBLE_DEVICES="$BEST_GPU"
-    else
-        export CUDA_VISIBLE_DEVICES=0
-    fi
+    NUM_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
 }
 
-select_idle_gpu
+detect_gpus
 
 # Default: Full 50 Billion Tokens
 TOKENS="${1:-50000000000}"
@@ -33,16 +27,28 @@ SFT_STEPS="${2:-5000}"
 
 echo "=================================================================="
 echo " 1 Billion Parameter Production SLM Pipeline"
+echo " Detected GPUs              : $NUM_GPUS"
 echo " Pre-training Target Tokens : $TOKENS (50 Billion Tokens)"
 echo " Dialogue Tuning Steps      : $SFT_STEPS (5,000 steps)"
-echo " CUDA_VISIBLE_DEVICES       : $CUDA_VISIBLE_DEVICES"
 echo "=================================================================="
+
+# Determine launcher command
+if [ "$NUM_GPUS" -ge 2 ]; then
+    echo "--> [Multi-GPU] Scaling across 2x L40S GPUs using torchrun (Near 2x Linear Speedup)..."
+    LAUNCH_CMD="torchrun --nproc_per_node=2"
+elif [ "$NUM_GPUS" -eq 1 ]; then
+    echo "--> [Single-GPU] Running on 1x GPU..."
+    LAUNCH_CMD="python3"
+else
+    echo "--> [CPU fallback] Running on CPU..."
+    LAUNCH_CMD="python3"
+fi
 
 # ------------------------------------------------------------------
 # Stage 1: 50BT Streaming Pre-training with Auto-Resume & Auto-Cleanup
 # ------------------------------------------------------------------
 echo "--> [Stage 1/3] Starting 50BT Spectral Pre-training (Auto-resumes if interrupted)..."
-python3 train_1b_spectral_stream.py \
+$LAUNCH_CMD train_1b_spectral_stream.py \
     --tokens "$TOKENS" \
     --batch_size 128 \
     --workers 8 \
@@ -50,10 +56,11 @@ python3 train_1b_spectral_stream.py \
     --output "bitnet_1b_pretrained.pt"
 
 # ------------------------------------------------------------------
-# Stage 2: Dialogue Instruction Tuning with Auto-Resume
+# Stage 2: Dialogue SFT Alignment with Auto-Resume & Auto-Cleanup
 # ------------------------------------------------------------------
-echo "--> [Stage 2/3] Starting Dialogue Instruction Tuning..."
-python3 tune_1b_dialogue.py \
+echo ""
+echo "--> [Stage 2/3] Starting ChatML Dialogue Instruction Tuning (Auto-resumes if interrupted)..."
+$LAUNCH_CMD tune_1b_dialogue.py \
     --base_ckpt "bitnet_1b_pretrained.pt" \
     --steps "$SFT_STEPS" \
     --batch_size 16 \
@@ -61,15 +68,20 @@ python3 tune_1b_dialogue.py \
     --output "bitnet_1b_dialogue_chat.pt"
 
 # ------------------------------------------------------------------
-# Stage 3: Bit-pack into 260MB 1.58-bit production binary
+# Stage 3: Bit-pack into 260MB edge binary for instant local CPU chat
 # ------------------------------------------------------------------
-echo "--> [Stage 3/3] Packing 1B model into 260MB 1.58-bit binary..."
-python3 ../hopfield/pack_checkpoint_158bit.py \
-    --checkpoint "bitnet_1b_dialogue_chat.pt" \
-    --output "bitnet_1b_packed_edge.pt"
+echo ""
+echo "--> [Stage 3/3] Compressing 1B FP32 Weights into 1.58-bit Ternary Edge Binary..."
+python3 -c "
+import sys
+sys.path.insert(0, '../hopfield')
+from pack_checkpoint_158bit import pack_checkpoint_158bit
+pack_checkpoint_158bit('bitnet_1b_dialogue_chat.pt', 'bitnet_1b_packed_edge.pt')
+"
 
 echo "=================================================================="
-echo " 1B SLM Pipeline Finished Successfully!"
-echo " Deployable Model: bitnet_1b_packed_edge.pt (~262 MB)"
-echo " Test locally using: python3 chat_local_1b.py --checkpoint bitnet_1b_packed_edge.pt"
+echo " 1B SLM Full Training & Dialogue Alignment Completed!"
+echo " 1. Pre-trained Base Model : bitnet_1b_pretrained.pt"
+echo " 2. ChatML Assistant Model : bitnet_1b_dialogue_chat.pt"
+echo " 3. Edge-Deployable 260MB  : bitnet_1b_packed_edge.pt"
 echo "=================================================================="
