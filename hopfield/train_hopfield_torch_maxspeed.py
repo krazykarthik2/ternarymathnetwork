@@ -101,7 +101,7 @@ def main():
     parser.add_argument("--seq_len", type=int, default=512)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--workers", type=int, default=4, help="CPU worker processes for data preloading")
-    parser.add_argument("--compile", action="store_true", default=True, help="Use torch.compile")
+    parser.add_argument("--compile", action="store_true", default=False, help="Use torch.compile (disabled by default for custom autograd functions)")
     parser.add_argument("--output_dir", type=str, default="checkpoints_maxspeed")
     args = parser.parse_args()
 
