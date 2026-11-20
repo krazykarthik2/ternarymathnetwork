@@ -137,11 +137,14 @@ def run_production_laplacian_training(target_tokens=10_000_000_000, batch_size=2
     cov_yx = torch.zeros(D, D, dtype=torch.float32, device=device)
     l_feat_accum = torch.zeros(D, D, dtype=torch.float32, device=device)
 
+    # Pre-allocate fixed static GPU buffer for Graph Laplacian samples (0 CPU transfers, 0 allocations)
+    sample_pool_gpu = torch.empty((2048, D), dtype=torch.float32, device=device)
+    sample_count = 0
+
     total_tokens_seen = 0
     t0 = time.time()
     last_report_time = t0
     last_report_tokens = 0
-    sample_pool = []
 
     print("\n[Step 1] Streaming tokens and computing zero-backprop covariance accumulation...")
     for bx, by in loader:
@@ -160,11 +163,12 @@ def run_production_laplacian_training(target_tokens=10_000_000_000, batch_size=2
             cov_xx.addmm_(h_x.t(), h_x)
             cov_yx.addmm_(h_y.t(), h_x)
 
-            # Sample subset for Graph Laplacian calculation (moved to CPU to avoid VRAM accumulation)
-            if len(sample_pool) < 2048:
-                sample_pool.append(h_x[:64].detach().cpu())
+            # Fill pre-allocated GPU buffer directly in VRAM (runs only for the first 32 steps!)
+            if sample_count < 2048:
+                n_take = min(64, 2048 - sample_count)
+                sample_pool_gpu[sample_count:sample_count + n_take].copy_(h_x[:n_take])
+                sample_count += n_take
 
-            # Free batch tensors immediately
             del h_x, h_y, pos
 
         now = time.time()
@@ -186,10 +190,9 @@ def run_production_laplacian_training(target_tokens=10_000_000_000, batch_size=2
     cov_xx /= float(total_tokens_seen)
     cov_yx /= float(total_tokens_seen)
 
-    # Compute Graph Laplacian Regularizer from token manifold
+    # Compute Graph Laplacian Regularizer directly from pre-allocated GPU buffer
     print("\n[Step 2] Computing Zelnik-Manor Graph Laplacian from token manifold...")
-    h_sample = torch.cat(sample_pool, dim=0)[:2048].to(device)
-    l_feat = compute_zelnik_laplacian_regularizer(h_sample, k=12)
+    l_feat = compute_zelnik_laplacian_regularizer(sample_pool_gpu, k=12)
 
     # Solve weights in closed form
     solve_laplacian_weights_closed_form(model, cov_xx, cov_yx, l_feat, ridge=ridge)
