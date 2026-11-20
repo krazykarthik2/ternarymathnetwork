@@ -2,7 +2,7 @@
 Phase B: Native Zero-Shot Downstream Task Evaluation Harness.
 Self-contained, ultra-robust evaluator using Hugging Face datasets directly
 (HellaSwag, PIQA, ARC-Easy, WinoGrande) via exact discrete log-likelihood ranking.
-Supports modern datasets library without deprecated .py dataset scripts.
+Bypasses deprecated dataset loading scripts completely by pointing directly to Parquet data files.
 """
 import os
 import sys
@@ -50,7 +50,7 @@ class DiscreteBitNetWrapper:
 
     def score_choice(self, prompt, choice):
         """Calculates normalized log-likelihood of completing prompt with choice."""
-        full_text = prompt + (" " if prompt and not prompt.endswith(" ") else "") + choice
+        full_text = prompt + (" " if prompt and not prompt.endswith(" ") else "") + str(choice)
         enc_full = self.tokenizer.encode(full_text)
         enc_prompt = self.tokenizer.encode(prompt)
 
@@ -75,7 +75,7 @@ def eval_hellaswag(model_wrapper, num_samples=500):
         ds = load_dataset("Rowan/hellaswag", split="validation", streaming=True)
     except Exception:
         try:
-            ds = load_dataset("hellaswag", split="validation", streaming=True, trust_remote_code=True)
+            ds = load_dataset("parquet", data_files={"validation": "https://huggingface.co/datasets/Rowan/hellaswag/resolve/main/data/hellaswag-validation.parquet"}, split="validation", streaming=True)
         except Exception:
             ds = load_dataset("hellaswag", split="validation", streaming=True)
 
@@ -102,14 +102,16 @@ def eval_hellaswag(model_wrapper, num_samples=500):
 
 def eval_piqa(model_wrapper, num_samples=500):
     print(f"\n--> Evaluating PIQA ({num_samples} samples)...")
+    # Load direct Parquet URL to completely bypass the deprecated piqa.py script
+    parquet_url = "https://huggingface.co/datasets/ybisk/piqa/resolve/main/plain_text/validation-00000-of-00001.parquet"
     try:
-        # Modern HuggingFace dataset path avoiding piqa.py legacy script
-        ds = load_dataset("ybisk/piqa", split="validation", streaming=True, trust_remote_code=True)
+        ds = load_dataset("parquet", data_files={"validation": parquet_url}, split="validation", streaming=True)
     except Exception:
         try:
-            ds = load_dataset("ybisk/piqa", split="validation", streaming=True)
-        except Exception:
-            ds = load_dataset("piqa", split="validation", streaming=True, trust_remote_code=True)
+            ds = load_dataset("ybisk/piqa", "plain_text", split="validation", streaming=True)
+        except Exception as e:
+            print(f"[!] Warning: Could not load remote PIQA ({e}), attempting fallback...")
+            return {"accuracy": 0.0, "correct": 0, "total": 0, "error": str(e)}
 
     correct = 0
     total = 0
@@ -139,7 +141,10 @@ def eval_arc_easy(model_wrapper, num_samples=500):
     try:
         ds = load_dataset("allenai/ai2_arc", "ARC-Easy", split="validation", streaming=True)
     except Exception:
-        ds = load_dataset("ai2_arc", name="ARC-Easy", split="validation", streaming=True, trust_remote_code=True)
+        try:
+            ds = load_dataset("parquet", data_files={"validation": "https://huggingface.co/datasets/allenai/ai2_arc/resolve/refs%2Fconvert%2Fparquet/ARC-Easy/validation/0000.parquet"}, split="validation", streaming=True)
+        except Exception:
+            ds = load_dataset("ai2_arc", name="ARC-Easy", split="validation", streaming=True)
 
     correct = 0
     total = 0
@@ -157,7 +162,7 @@ def eval_arc_easy(model_wrapper, num_samples=500):
         best_idx = int(torch.tensor(scores).argmax().item())
         pred_label = labels[best_idx] if best_idx < len(labels) else ""
 
-        if pred_label == answer_key:
+        if str(pred_label).strip() == str(answer_key).strip():
             correct += 1
         total += 1
 
@@ -171,7 +176,10 @@ def eval_winogrande(model_wrapper, num_samples=500):
     try:
         ds = load_dataset("allenai/winogrande", "winogrande_xl", split="validation", streaming=True)
     except Exception:
-        ds = load_dataset("winogrande", "winogrande_xl", split="validation", streaming=True, trust_remote_code=True)
+        try:
+            ds = load_dataset("parquet", data_files={"validation": "https://huggingface.co/datasets/allenai/winogrande/resolve/refs%2Fconvert%2Fparquet/winogrande_xl/validation/0000.parquet"}, split="validation", streaming=True)
+        except Exception:
+            ds = load_dataset("winogrande", "winogrande_xl", split="validation", streaming=True)
 
     correct = 0
     total = 0
@@ -182,7 +190,7 @@ def eval_winogrande(model_wrapper, num_samples=500):
         sentence = item.get("sentence", "")
         opt1 = item.get("option1", "")
         opt2 = item.get("option2", "")
-        answer = item.get("answer", "1")
+        answer = str(item.get("answer", "1"))
         label = 0 if answer == "1" else 1
 
         p1 = sentence.replace("_", opt1)
