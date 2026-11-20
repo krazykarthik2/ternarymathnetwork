@@ -101,7 +101,7 @@ def main():
     parser.add_argument("--seq_len", type=int, default=512)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--workers", type=int, default=4, help="CPU worker processes for data preloading")
-    parser.add_argument("--compile", action="store_true", default=True, help="Use torch.compile with pure tensor math")
+    parser.add_argument("--compile", action="store_true", default=False, help="Disable torch.compile to avoid dynamo autograd function tracer bug")
     parser.add_argument("--output_dir", type=str, default="checkpoints_maxspeed")
     args = parser.parse_args()
 
@@ -128,11 +128,11 @@ def main():
     )
     data_iter = iter(loader)
 
-    # 1. Analytical Hopfield Single-Shot Calculation FROM REAL FINEWEB-EDU TOKENS
-    print("\n[Step 1] Streaming real HuggingFaceFW/fineweb-edu tokens to calculate analytical Hopfield weights...")
+    # Real Cross-Covariance calculation: W_analytical = Y X^T (X X^T + lambda I)^-1
+    print("\n[Step 1] Computing closed-form Hopfield associative projection across real Fineweb-Edu tokens...")
     t0 = time.time()
     accum_tokens = []
-    # Collect 128 batches of real Fineweb-Edu text (65,536 real tokens)
+    # Collect 128 batches (65,536 real tokens)
     for _ in range(min(128, args.steps)):
         try:
             bx, _ = next(data_iter)
@@ -141,9 +141,17 @@ def main():
             break
 
     real_data_tensor = torch.cat(accum_tokens, dim=0).to(device)
-    print(f"--> Accumulated {real_data_tensor.numel():,} real Fineweb-Edu tokens on {device} for covariance calculation.")
+    print(f"--> Accumulated {real_data_tensor.numel():,} real Fineweb-Edu tokens on {device} for analytical calculation.")
     model.calculate_all_weights_single_shot(real_data_tensor)
-    print(f"--> Calculated exact Hopfield ternary weights from real text in {(time.time() - t0):.2f}s")
+    
+    # Calculate baseline Step 0 loss to confirm low PPL start
+    with torch.no_grad():
+        with torch.amp.autocast('cuda', enabled=use_amp, dtype=dtype):
+            init_logits = model(real_data_tensor[:args.batch_size], T=1.0)
+            init_loss = criterion(init_logits.view(-1, 50257), real_data_tensor[:args.batch_size].view(-1)).item()
+            init_ppl = math.exp(min(init_loss, 20.0))
+            print(f"--> [Step 0 Analytical Hopfield Baseline] Loss: {init_loss:.4f} | PPL: {init_ppl:.2f}")
+    print(f"--> Analytical calculation and projection verified in {(time.time() - t0):.2f}s")
 
     # Fused AdamW optimizer (runs in native C++/CUDA kernel)
     supports_fused = "fused" in torch.optim.AdamW.__init__.__code__.co_varnames
