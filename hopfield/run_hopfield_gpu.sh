@@ -1,16 +1,34 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # GPU VM Master Launch Script: Hopfield-BitNet b1.58 (125M Architecture)
-# Tailored for NVIDIA L40S (48GB VRAM) or standard enterprise GPUs.
+# Tailored for NVIDIA L40S. Auto-selects the idle GPU if another is busy.
 # ==============================================================================
 set -e
 
-# Change directory strictly to the hopfield folder
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+select_idle_gpu() {
+    if ! command -v nvidia-smi &> /dev/null; then
+        echo "[!] nvidia-smi not found. Defaulting to CUDA_VISIBLE_DEVICES=0"
+        export CUDA_VISIBLE_DEVICES=0
+        return
+    fi
+    BEST_GPU=$(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits | sort -k2 -n | head -n 1 | awk -F',' '{print $1}' | tr -d ' ')
+    USED_MEM=$(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits | sort -k2 -n | head -n 1 | awk -F',' '{print $2}' | tr -d ' ')
+    if [ -n "$BEST_GPU" ]; then
+        echo "--> Selected idle GPU index: $BEST_GPU (Current memory used: ${USED_MEM} MiB)"
+        export CUDA_VISIBLE_DEVICES="$BEST_GPU"
+    else
+        export CUDA_VISIBLE_DEVICES=0
+    fi
+}
+
+select_idle_gpu
+
 echo "=================================================================="
 echo " Starting Hopfield-BitNet-125M Execution on GPU VM"
+echo " CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
 echo " Working directory: $(pwd)"
 echo "=================================================================="
 
@@ -29,7 +47,7 @@ if torch.cuda.is_available():
 # Parse launch arguments
 METHOD="${1:-mige_ta}"      # Options: mige_ta, ste, discrete
 STEPS="${2:-10000}"         # Target steps
-BATCH_SIZE="${3:-16}"       # Optimal batch size for L40S 48GB (can increase to 32 or 64)
+BATCH_SIZE="${3:-32}"       # Optimal batch size for L40S 48GB
 SEQ_LEN="${4:-512}"
 DATASET="${5:-HuggingFaceFW/fineweb-edu}"
 SUBSET="${6:-sample-10BT}"
