@@ -2,7 +2,7 @@
 Phase B: Native Zero-Shot Downstream Task Evaluation Harness.
 Self-contained, ultra-robust evaluator using Hugging Face datasets directly
 (HellaSwag, PIQA, ARC-Easy, WinoGrande) via exact discrete log-likelihood ranking.
-Works with or without external lm_eval installation.
+Supports modern datasets library without deprecated .py dataset scripts.
 """
 import os
 import sys
@@ -58,18 +58,14 @@ class DiscreteBitNetWrapper:
         with torch.no_grad():
             with torch.amp.autocast(self.device.type, enabled=(self.device.type == "cuda"), dtype=torch.bfloat16):
                 logits = self.model(input_ids)
-            # Log probabilities
             log_probs = F.log_softmax(logits[0, :-1], dim=-1)
 
-            # Target choices slice
             target_ids = input_ids[0, 1:]
             choice_start = max(0, len(enc_prompt) - 1)
             choice_targets = target_ids[choice_start:]
             choice_log_probs = log_probs[choice_start:]
 
-            # Sum log probability for choice tokens
             score = choice_log_probs.gather(1, choice_targets.unsqueeze(1)).sum().item()
-            # Length normalization
             norm_score = score / max(1, len(choice_targets))
             return norm_score
 
@@ -78,7 +74,10 @@ def eval_hellaswag(model_wrapper, num_samples=500):
     try:
         ds = load_dataset("Rowan/hellaswag", split="validation", streaming=True)
     except Exception:
-        ds = load_dataset("hellaswag", split="validation", streaming=True)
+        try:
+            ds = load_dataset("hellaswag", split="validation", streaming=True, trust_remote_code=True)
+        except Exception:
+            ds = load_dataset("hellaswag", split="validation", streaming=True)
 
     correct = 0
     total = 0
@@ -103,7 +102,15 @@ def eval_hellaswag(model_wrapper, num_samples=500):
 
 def eval_piqa(model_wrapper, num_samples=500):
     print(f"\n--> Evaluating PIQA ({num_samples} samples)...")
-    ds = load_dataset("piqa", split="validation", streaming=True)
+    try:
+        # Modern HuggingFace dataset path avoiding piqa.py legacy script
+        ds = load_dataset("ybisk/piqa", split="validation", streaming=True, trust_remote_code=True)
+    except Exception:
+        try:
+            ds = load_dataset("ybisk/piqa", split="validation", streaming=True)
+        except Exception:
+            ds = load_dataset("piqa", split="validation", streaming=True, trust_remote_code=True)
+
     correct = 0
     total = 0
     t0 = time.time()
@@ -129,7 +136,11 @@ def eval_piqa(model_wrapper, num_samples=500):
 
 def eval_arc_easy(model_wrapper, num_samples=500):
     print(f"\n--> Evaluating ARC-Easy ({num_samples} samples)...")
-    ds = load_dataset("ai2_arc", name="ARC-Easy", split="validation", streaming=True)
+    try:
+        ds = load_dataset("allenai/ai2_arc", "ARC-Easy", split="validation", streaming=True)
+    except Exception:
+        ds = load_dataset("ai2_arc", name="ARC-Easy", split="validation", streaming=True, trust_remote_code=True)
+
     correct = 0
     total = 0
     t0 = time.time()
@@ -157,7 +168,11 @@ def eval_arc_easy(model_wrapper, num_samples=500):
 
 def eval_winogrande(model_wrapper, num_samples=500):
     print(f"\n--> Evaluating WinoGrande ({num_samples} samples)...")
-    ds = load_dataset("winogrande", "winogrande_xl", split="validation", streaming=True)
+    try:
+        ds = load_dataset("allenai/winogrande", "winogrande_xl", split="validation", streaming=True)
+    except Exception:
+        ds = load_dataset("winogrande", "winogrande_xl", split="validation", streaming=True, trust_remote_code=True)
+
     correct = 0
     total = 0
     t0 = time.time()
@@ -170,7 +185,6 @@ def eval_winogrande(model_wrapper, num_samples=500):
         answer = item.get("answer", "1")
         label = 0 if answer == "1" else 1
 
-        # Replace _ with option
         p1 = sentence.replace("_", opt1)
         p2 = sentence.replace("_", opt2)
         s1 = model_wrapper.score_choice("", p1)
@@ -209,7 +223,6 @@ def evaluate_downstream(checkpoint_path, name, scale="125M", num_samples=500, ou
     print(f"[{name}] SUMMARY: Average Zero-Shot Accuracy = {avg_acc:.2f}%")
     print("=" * 80)
 
-    # Save to JSON
     os.makedirs(os.path.dirname(output_json) or ".", exist_ok=True)
     all_results = {}
     if os.path.exists(output_json):
