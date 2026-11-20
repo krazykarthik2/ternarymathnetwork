@@ -219,7 +219,7 @@ def run_production_laplacian_training(target_tokens=10_000_000_000, batch_size=2
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Zero-Backprop Production Spectral-Laplacian BitNet")
     parser.add_argument("--tokens", type=int, default=10_000_000_000)
-    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--batch_size", type=int, default=512, help="Scaled to 512 to saturate L40S Tensor Cores and utilize VRAM")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--ridge", type=float, default=1e-4)
     parser.add_argument("--output", type=str, default="production_bitnet/production_laplacian_10bt.pt")
