@@ -116,6 +116,12 @@ def main():
     for layer in model.layers:
         layer.attn = FastFlashAttention(dim=768, n_heads=12, method="temp_anneal").to(device)
 
+    # Device & Precision setup
+    use_amp = torch.cuda.is_available()
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+    criterion = nn.CrossEntropyLoss()
+
     # Multi-worker asynchronous PyTorch DataLoader streaming REAL Fineweb-Edu
     dataset = FastStreamingDataset("HuggingFaceFW/fineweb-edu", "sample-10BT", seq_len=args.seq_len)
     loader = DataLoader(
