@@ -2,7 +2,6 @@
 Phase B: Native Zero-Shot Downstream Task Evaluation Harness.
 Self-contained, ultra-robust evaluator using Hugging Face datasets directly
 (HellaSwag, PIQA, ARC-Easy, WinoGrande) via exact discrete log-likelihood ranking.
-Bypasses deprecated dataset loading scripts completely by pointing directly to Parquet data files.
 """
 import os
 import sys
@@ -102,15 +101,16 @@ def eval_hellaswag(model_wrapper, num_samples=500):
 
 def eval_piqa(model_wrapper, num_samples=500):
     print(f"\n--> Evaluating PIQA ({num_samples} samples)...")
-    # Load direct Parquet URL to completely bypass the deprecated piqa.py script
-    parquet_url = "https://huggingface.co/datasets/ybisk/piqa/resolve/main/plain_text/validation-00000-of-00001.parquet"
+    # Clean mirror URL guaranteed to bypass piqa.py script crash
+    parquet_url = "https://huggingface.co/datasets/baber/piqa/resolve/main/piqa_validation.parquet"
     try:
         ds = load_dataset("parquet", data_files={"validation": parquet_url}, split="validation", streaming=True)
     except Exception:
         try:
-            ds = load_dataset("ybisk/piqa", "plain_text", split="validation", streaming=True)
+            parquet_backup = "https://huggingface.co/datasets/ybisk/piqa/resolve/main/plain_text/validation-00000-of-00001.parquet"
+            ds = load_dataset("parquet", data_files={"validation": parquet_backup}, split="validation", streaming=True)
         except Exception as e:
-            print(f"[!] Warning: Could not load remote PIQA ({e}), attempting fallback...")
+            print(f"[!] Warning: Could not load PIQA ({e})")
             return {"accuracy": 0.0, "correct": 0, "total": 0, "error": str(e)}
 
     correct = 0
@@ -224,9 +224,13 @@ def evaluate_downstream(checkpoint_path, name, scale="125M", num_samples=500, ou
     results["arc_easy"] = eval_arc_easy(wrapper, num_samples=num_samples)
     results["winogrande"] = eval_winogrande(wrapper, num_samples=num_samples)
 
-    avg_acc = (results["hellaswag"]["accuracy"] + results["piqa"]["accuracy"] +
-               results["arc_easy"]["accuracy"] + results["winogrande"]["accuracy"]) / 4.0
+    valid_accs = [
+        res["accuracy"] for k, res in results.items()
+        if "accuracy" in res and res["total"] > 0
+    ]
+    avg_acc = (sum(valid_accs) / len(valid_accs)) if valid_accs else 0.0
     results["average_acc"] = avg_acc
+
     print("\n" + "=" * 80)
     print(f"[{name}] SUMMARY: Average Zero-Shot Accuracy = {avg_acc:.2f}%")
     print("=" * 80)
