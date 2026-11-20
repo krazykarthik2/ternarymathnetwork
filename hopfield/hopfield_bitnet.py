@@ -235,21 +235,53 @@ class HopfieldBitNet125M(nn.Module):
     @torch.no_grad()
     def calculate_all_weights_single_shot(self, sample_tokens: torch.Tensor):
         """
-        Calculates all Hopfield associative weights across layers in a single shot
-        from target embedding states.
+        DIRECT FULL-MODEL WARM INITIALIZATION VIA HOPFIELD HEBBIAN ASSOCIATION:
+        Calculates the ternary weights for EVERY SINGLE LINEAR LAYER:
+        - Self-Attention Q, K, V, and Out projections
+        - FeedForward Gate, Up, and Down projections
+        from actual linguistic token hidden states.
         """
         B, S = sample_tokens.shape
         pos = torch.arange(0, S, dtype=torch.long, device=sample_tokens.device).unsqueeze(0)
         h = self.tok_embeddings(sample_tokens) + self.pos_embeddings(pos)
 
-        # Compute associative patterns across layers
         flat_h = h.view(-1, self.dim)
-        # Select representative subset
-        num_patterns = min(1024, flat_h.size(0))
-        patterns = flat_h[:num_patterns]
+        N = flat_h.size(0)
 
-        for layer in self.layers:
-            layer.hopfield_mem.calculate_weights_single_shot(patterns)
+        # Autocorrelation of token embeddings: C = (1/N) * H^T H
+        cov_hh = torch.matmul(flat_h.t(), flat_h) / float(N)
+
+        for layer_idx, layer in enumerate(self.layers):
+            norm_h = layer.norm1(flat_h)
+
+            # 1. Warm-initialize Attention Projections (Q, K, V, Out) directly
+            # Q & K: Positive correlation associative mapping
+            gamma_attn = cov_hh.abs().mean().clamp(min=1e-5)
+            w_ternary_attn = hard_ternary(cov_hh / gamma_attn, threshold=0.5) * gamma_attn
+            
+            layer.attn.q_proj.weight.copy_(w_ternary_attn)
+            layer.attn.k_proj.weight.copy_(w_ternary_attn)
+            layer.attn.v_proj.weight.copy_(w_ternary_attn)
+            layer.attn.out_proj.weight.copy_(w_ternary_attn)
+
+            # 2. Warm-initialize FFN Projections (Gate, Up, Down)
+            # Gate & Up map from dim (768) -> hidden_dim (2048)
+            # Down maps from hidden_dim (2048) -> dim (768)
+            norm_h2 = layer.norm2(flat_h)
+            d_in, d_out = layer.ffn.gate_proj.in_features, layer.ffn.gate_proj.out_features
+            
+            # Tile cross-covariance to match FFN dimensional expansion
+            reps_r = math.ceil(d_out / d_in)
+            ffn_cov = cov_hh.repeat(reps_r, 1)[:d_out, :d_in]
+            gamma_ffn = ffn_cov.abs().mean().clamp(min=1e-5)
+            w_ternary_ffn = hard_ternary(ffn_cov / gamma_ffn, threshold=0.5) * gamma_ffn
+
+            layer.ffn.gate_proj.weight.copy_(w_ternary_ffn)
+            layer.ffn.up_proj.weight.copy_(w_ternary_ffn)
+            layer.ffn.down_proj.weight.copy_(w_ternary_ffn.t()[:d_in, :d_out])
+
+            # 3. Hopfield associative memory unit
+            layer.hopfield_mem.calculate_weights_single_shot(flat_h[:min(1024, N)])
 
     def forward(self, input_ids: torch.Tensor, T: float = 1.0, epsilon: float = 0.25) -> torch.Tensor:
         B, S = input_ids.shape
