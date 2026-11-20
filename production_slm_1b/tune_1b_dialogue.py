@@ -2,16 +2,15 @@
 production_slm_1b/tune_1b_dialogue.py
 
 Stage 2: Dialogue & Instruction Alignment for 1B BitNet SLM:
-Loads pre-trained 1B weights from Stage 1.
-Fine-tunes on conversational multi-turn dialogue (UltraChat / OpenHermes)
-using ChatML standard:
-<|im_start|>user
-{user_input}<|im_end|>
-<|im_start|>assistant
-{response}<|im_end|>
+- SFT with ChatML multi-turn conversational format.
+- Automatic Checkpoint Recovery:
+  * Saves optimizer state, scheduler (LR), step, and model weights every 500 steps.
+  * Auto-resumes from latest checkpoint on failure.
+  * Deletes older checkpoints automatically.
 """
 import os
 import sys
+import glob
 import math
 import time
 import argparse
@@ -25,6 +24,25 @@ os.environ["TOKENIZERS_PARALLELISM"] = "true"
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../hopfield")))
 from bitnet_1b_model import ProductionBitNet1B
+
+
+def cleanup_old_sft_checkpoints(ckpt_dir: str, keep_latest: int = 1):
+    """Deletes older SFT checkpoint files."""
+    pattern = os.path.join(ckpt_dir, "sft_ckpt_step_*.pt")
+    ckpts = sorted(glob.glob(pattern), key=os.path.getmtime)
+    if len(ckpts) > keep_latest:
+        for old in ckpts[:-keep_latest]:
+            try:
+                os.remove(old)
+                print(f"--> [Auto-Cleanup] Deleted older SFT checkpoint: {os.path.basename(old)}")
+            except Exception as e:
+                print(f"[!] Warning deleting {old}: {e}")
+
+
+def find_latest_sft_checkpoint(ckpt_dir: str):
+    pattern = os.path.join(ckpt_dir, "sft_ckpt_step_*.pt")
+    ckpts = sorted(glob.glob(pattern), key=os.path.getmtime)
+    return ckpts[-1] if ckpts else None
 
 
 class DialogueDataset(IterableDataset):
@@ -61,30 +79,44 @@ class DialogueDataset(IterableDataset):
                        torch.tensor(tokens[1:], dtype=torch.long))
 
 
-def run_dialogue_tuning(base_ckpt: str, steps: int = 2500, lr: float = 3e-4, batch_size: int = 16,
-                        output_file: str = "bitnet_1b_dialogue_chat.pt"):
+def run_dialogue_tuning(base_ckpt: str, steps: int = 5000, lr: float = 3e-4, batch_size: int = 16,
+                        ckpt_dir: str = "checkpoints_1b_sft", output_file: str = "bitnet_1b_dialogue_chat.pt"):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    os.makedirs(ckpt_dir, exist_ok=True)
+
     print("==================================================================")
-    print(f" 1B BitNet SLM Dialogue Instruction Tuning")
-    print(f" Device : {device}")
-    print(f" Target Steps: {steps:,} | Batch Size: {batch_size}")
+    print(f" 1B BitNet SLM Dialogue Instruction Tuning Engine")
+    print(f" Device          : {device}")
+    print(f" Target Steps    : {steps:,}")
+    print(f" Checkpoint Dir  : {ckpt_dir} (Auto-checkpointing & recovery enabled)")
     print("==================================================================")
 
     model = ProductionBitNet1B(dim=2048, n_layers=24, n_heads=16, hidden_dim=5632).to(device)
 
-    if os.path.exists(base_ckpt):
-        print(f"--> Loading base pre-trained 1B weights from: {base_ckpt}")
+    start_step = 1
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.95), weight_decay=0.01)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps, eta_min=lr * 0.1)
+
+    # Check for SFT resume checkpoint first
+    latest_sft = find_latest_sft_checkpoint(ckpt_dir)
+    if latest_sft and os.path.exists(latest_sft):
+        print(f"--> [Auto-Resume] Found previous SFT checkpoint: {latest_sft}")
+        sft_data = torch.load(latest_sft, map_location=device)
+        model.load_state_dict(sft_data["model_state_dict"])
+        optimizer.load_state_dict(sft_data["optimizer_state_dict"])
+        scheduler.load_state_dict(sft_data["scheduler_state_dict"])
+        start_step = sft_data["step"] + 1
+        print(f"--> [Auto-Resume] Successfully recovered at Step {start_step:,} / {steps:,} (LR: {optimizer.param_groups[0]['lr']:.2e})!")
+    elif os.path.exists(base_ckpt):
+        print(f"--> Loading pre-trained 1B foundation weights from: {base_ckpt}")
         ckpt = torch.load(base_ckpt, map_location=device)
         model.load_state_dict(ckpt, strict=False)
-        print("--> Pre-trained 1B foundation successfully loaded!")
-    else:
-        print("[!] Base checkpoint not found, training directly.")
+        print("--> Base foundation model loaded successfully!")
 
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
 
     def collate_fn(batch):
-        # Pad dynamically to max length in batch
         max_b = max(len(x) for x, y in batch)
         bx, by = [], []
         for x, y in batch:
@@ -97,10 +129,7 @@ def run_dialogue_tuning(base_ckpt: str, steps: int = 2500, lr: float = 3e-4, bat
     dataset = DialogueDataset(tokenizer, max_len=512)
     loader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.95), weight_decay=0.01)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps, eta_min=lr * 0.1)
     criterion = nn.CrossEntropyLoss(ignore_index=-100)
-
     use_amp = torch.cuda.is_available()
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
@@ -109,7 +138,7 @@ def run_dialogue_tuning(base_ckpt: str, steps: int = 2500, lr: float = 3e-4, bat
     data_iter = iter(loader)
 
     print("\n--> Starting Dialogue SFT Optimization...")
-    for step in range(1, steps + 1):
+    for step in range(start_step, steps + 1):
         try:
             bx, by = next(data_iter)
         except StopIteration:
@@ -131,9 +160,23 @@ def run_dialogue_tuning(base_ckpt: str, steps: int = 2500, lr: float = 3e-4, bat
         scaler.update()
         scheduler.step()
 
-        if step % 25 == 0 or step == 1 or step == steps:
+        if step % 50 == 0 or step == start_step or step == steps:
             ppl = math.exp(min(loss.item(), 20.0))
-            print(f"SFT Step {step:04d}/{steps:04d} | Chat Loss: {loss.item():.4f} | PPL: {ppl:.2f} | Elapsed: {(time.time() - t0)/60:.1f}m")
+            cur_lr = optimizer.param_groups[0]["lr"]
+            print(f"SFT Step {step:05d}/{steps:05d} | Chat Loss: {loss.item():.4f} | PPL: {ppl:.2f} | LR: {cur_lr:.2e} | Elapsed: {(time.time() - t0)/60:.1f}m")
+
+        # Auto-Checkpointing every 500 steps
+        if step % 500 == 0 or step == steps:
+            ckpt_path = os.path.join(ckpt_dir, f"sft_ckpt_step_{step}.pt")
+            torch.save({
+                "step": step,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "loss": loss.item()
+            }, ckpt_path)
+            print(f"--> [Checkpoint] Saved SFT step {step} to: {ckpt_path}")
+            cleanup_old_sft_checkpoints(ckpt_dir, keep_latest=1)
 
     torch.save(model.state_dict(), output_file)
     print(f"\n--> Dialogue tuning finished! Saved final assistant SLM to: {output_file}")
@@ -142,9 +185,11 @@ def run_dialogue_tuning(base_ckpt: str, steps: int = 2500, lr: float = 3e-4, bat
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Tune 1B BitNet on Dialogue")
     parser.add_argument("--base_ckpt", type=str, default="production_slm_1b/bitnet_1b_pretrained.pt")
-    parser.add_argument("--steps", type=int, default=2500)
+    parser.add_argument("--steps", type=int, default=5000, help="Default: 5000 SFT steps")
     parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--ckpt_dir", type=str, default="checkpoints_1b_sft")
     parser.add_argument("--output", type=str, default="production_slm_1b/bitnet_1b_dialogue_chat.pt")
     args = parser.parse_args()
 
-    run_dialogue_tuning(base_ckpt=args.base_ckpt, steps=args.steps, batch_size=args.batch_size, output_file=args.output)
+    run_dialogue_tuning(base_ckpt=args.base_ckpt, steps=args.steps, batch_size=args.batch_size,
+                        ckpt_dir=args.ckpt_dir, output_file=args.output)

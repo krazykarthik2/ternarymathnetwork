@@ -1,12 +1,16 @@
 """
 production_slm_1b/train_1b_spectral_stream.py
 
-1 Billion Parameter Zero-Backprop Spectral Inversion Engine:
-Streams 10BT to 25BT tokens directly into 2048 x 2048 covariance accumulator on GPU.
-Zero backprop, zero AdamW memory overhead, ~1.1M tok/s on NVIDIA L40S.
+1 Billion Parameter Production SLM Streaming Spectral Engine:
+- Target: 50 Billion Tokens by default (~12.6 hours on 1x L40S)
+- Robust Auto-Resuming & Checkpointing:
+  * Saves active covariance statistics (cov_xx, cov_yx), tokens_seen, and state every 500M tokens.
+  * Recovers automatically if the VM restarts, preempts, or crashes.
+  * Safely cleans up and deletes previous older checkpoints to conserve disk space.
 """
 import os
 import sys
+import glob
 import math
 import time
 import argparse
@@ -29,21 +33,64 @@ from train_hopfield_torch_maxspeed import FastStreamingDataset
 from quantizers import hard_ternary
 
 
-def run_1b_spectral_inversion(tokens=10_000_000_000, batch_size=128, seq_len=512, workers=8,
-                              ridge=1e-4, output_file="bitnet_1b_pretrained.pt"):
+def cleanup_old_checkpoints(ckpt_dir: str, keep_latest: int = 1):
+    """Deletes older checkpoint files to prevent disk exhaustion."""
+    pattern = os.path.join(ckpt_dir, "spectral_ckpt_*_tokens.pt")
+    ckpts = sorted(glob.glob(pattern), key=os.path.getmtime)
+    if len(ckpts) > keep_latest:
+        for old in ckpts[:-keep_latest]:
+            try:
+                os.remove(old)
+                print(f"--> [Auto-Cleanup] Deleted older checkpoint: {os.path.basename(old)}")
+            except Exception as e:
+                print(f"[!] Warning deleting {old}: {e}")
+
+
+def find_latest_checkpoint(ckpt_dir: str):
+    """Finds the most recent valid checkpoint in directory."""
+    pattern = os.path.join(ckpt_dir, "spectral_ckpt_*_tokens.pt")
+    ckpts = sorted(glob.glob(pattern), key=os.path.getmtime)
+    return ckpts[-1] if ckpts else None
+
+
+def run_1b_spectral_inversion(tokens=50_000_000_000, batch_size=128, seq_len=512, workers=8,
+                              ridge=1e-4, ckpt_dir="checkpoints_1b_stream",
+                              ckpt_interval_tokens=500_000_000, output_file="bitnet_1b_pretrained.pt"):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    os.makedirs(ckpt_dir, exist_ok=True)
+
     print("==================================================================")
     print(f" 1 Billion Parameter Production SLM Streaming Spectral Engine")
-    print(f" Device       : {device} ({torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'})")
-    print(f" Target Tokens: {tokens:,}")
-    print(f" Batch Size   : {batch_size} (Tokens per batch: {batch_size * seq_len:,})")
+    print(f" Device          : {device} ({torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'})")
+    print(f" Target Tokens   : {tokens:,} (50 Billion Tokens)")
+    print(f" Batch Size      : {batch_size} (Tokens per batch: {batch_size * seq_len:,})")
+    print(f" Checkpoint Dir  : {ckpt_dir} (Auto-checkpointing every {ckpt_interval_tokens:,} tokens)")
     print("==================================================================")
 
     model = ProductionBitNet1B(dim=2048, n_layers=24, n_heads=16, hidden_dim=5632).to(device)
     D = model.dim
-    print(f"Model Total Parameters: {model.count_parameters():,}")
+    print(f"Model Parameters : {model.count_parameters():,}")
 
-    dataset = FastStreamingDataset("HuggingFaceFW/fineweb-edu", "sample-10BT", seq_len=seq_len)
+    # Initialize Global Covariances in VRAM (~16 MB)
+    cov_xx = torch.zeros(D, D, dtype=torch.float32, device=device)
+    cov_yx = torch.zeros(D, D, dtype=torch.float32, device=device)
+    total_tokens_seen = 0
+
+    # Auto-resume check
+    latest_ckpt = find_latest_checkpoint(ckpt_dir)
+    if latest_ckpt and os.path.exists(latest_ckpt):
+        print(f"\n--> [Auto-Resume] Found previous checkpoint: {latest_ckpt}")
+        ckpt_data = torch.load(latest_ckpt, map_location=device)
+        total_tokens_seen = ckpt_data["tokens_seen"]
+        cov_xx.copy_(ckpt_data["cov_xx"])
+        cov_yx.copy_(ckpt_data["cov_yx"])
+        if "tok_embeddings" in ckpt_data:
+            model.tok_embeddings.weight.data.copy_(ckpt_data["tok_embeddings"])
+        print(f"--> [Auto-Resume] Successfully recovered state at {total_tokens_seen:,} tokens ({total_tokens_seen / tokens * 100:.2f}%)!")
+    else:
+        print("\n--> Starting fresh pre-training run from token 0...")
+
+    dataset = FastStreamingDataset("HuggingFaceFW/fineweb-edu", "sample-100BT", seq_len=seq_len)
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -53,16 +100,12 @@ def run_1b_spectral_inversion(tokens=10_000_000_000, batch_size=128, seq_len=512
         prefetch_factor=2 if (workers > 0 and torch.cuda.is_available()) else None
     )
 
-    # 2048 x 2048 Global Covariance Matrices in VRAM (~16 MB)
-    cov_xx = torch.zeros(D, D, dtype=torch.float32, device=device)
-    cov_yx = torch.zeros(D, D, dtype=torch.float32, device=device)
-
-    total_tokens_seen = 0
     t0 = time.time()
     last_report_time = t0
-    last_report_tokens = 0
+    last_report_tokens = total_tokens_seen
+    last_ckpt_tokens = total_tokens_seen
 
-    print("\n[Stage 1] Ingesting tokens via forward-only streaming covariance accumulation...")
+    print("\n[Stage 1] Ingesting tokens via streaming covariance accumulation...")
     for bx, by in loader:
         x = bx.to(device, non_blocking=True)
         y = by.to(device, non_blocking=True)
@@ -83,14 +126,13 @@ def run_1b_spectral_inversion(tokens=10_000_000_000, batch_size=128, seq_len=512
         now = time.time()
         if now - last_report_time >= 15.0:
             elapsed = now - t0
-            interval_speed = (total_tokens_seen - last_report_tokens) / (now - last_report_time)
-            avg_speed = total_tokens_seen / elapsed
+            interval_speed = (total_tokens_seen - last_report_tokens) / max(now - last_report_time, 1e-4)
+            avg_speed = (total_tokens_seen - last_ckpt_tokens) / max(elapsed, 1e-4)
             eta_sec = (tokens - total_tokens_seen) / max(avg_speed, 1.0)
             pct = (total_tokens_seen / tokens) * 100.0
 
-            # Approximation trace
-            norm_cxx = cov_xx / float(total_tokens_seen)
-            norm_cyx = cov_yx / float(total_tokens_seen)
+            norm_cxx = cov_xx / max(1.0, float(total_tokens_seen))
+            norm_cyx = cov_yx / max(1.0, float(total_tokens_seen))
             approx_loss = 3.0 + min(7.0, (norm_cxx.trace() - 2.0 * norm_cyx.trace()).abs().item() * 0.02)
             ppl = math.exp(min(approx_loss, 20.0))
 
@@ -98,11 +140,27 @@ def run_1b_spectral_inversion(tokens=10_000_000_000, batch_size=128, seq_len=512
             last_report_time = now
             last_report_tokens = total_tokens_seen
 
+        # Periodic Auto-Checkpointing & Old Checkpoint Pruning
+        if total_tokens_seen - last_ckpt_tokens >= ckpt_interval_tokens:
+            ckpt_path = os.path.join(ckpt_dir, f"spectral_ckpt_{total_tokens_seen}_tokens.pt")
+            torch.save({
+                "tokens_seen": total_tokens_seen,
+                "cov_xx": cov_xx.cpu(),
+                "cov_yx": cov_yx.cpu(),
+                "tok_embeddings": model.tok_embeddings.weight.data.cpu()
+            }, ckpt_path)
+            # Re-upload to device
+            cov_xx = cov_xx.to(device)
+            cov_yx = cov_yx.to(device)
+            print(f"--> [Checkpoint] Saved progress at {total_tokens_seen:,} tokens to: {ckpt_path}")
+            cleanup_old_checkpoints(ckpt_dir, keep_latest=1)
+            last_ckpt_tokens = total_tokens_seen
+
         if total_tokens_seen >= tokens:
             break
 
-    # Solve closed form weights
-    print("\n[Stage 2] Solving Closed-Form 1B Harmonic Weights across 2048-dim Manifold...")
+    # Solve closed-form harmonic weights
+    print(f"\n[Stage 2] Solving Closed-Form 1B Harmonic Weights from {total_tokens_seen:,} tokens...")
     cov_xx /= float(total_tokens_seen)
     cov_yx /= float(total_tokens_seen)
 
@@ -127,19 +185,22 @@ def run_1b_spectral_inversion(tokens=10_000_000_000, batch_size=128, seq_len=512
 
         model.output_head.weight.copy_(model.tok_embeddings.weight / math.sqrt(D))
 
+    os.makedirs(os.path.dirname(output_file) or ".", exist_ok=True)
     torch.save(model.state_dict(), output_file)
     print(f"\n============================================================")
-    print(f" 1 Billion Parameter SLM Pre-training Complete in {(time.time() - t0)/60:.2f} Minutes!")
-    print(f" Saved Model to: {output_file}")
+    print(f" 50 Billion Token SLM Pre-training Complete in {(time.time() - t0)/60:.2f} Minutes!")
+    print(f" Final Foundation Model Saved to: {output_file}")
     print(f"============================================================")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="1B SLM Spectral Inversion Engine")
-    parser.add_argument("--tokens", type=int, default=10_000_000_000)
+    parser = argparse.ArgumentParser(description="50BT Production 1B SLM Spectral Engine")
+    parser.add_argument("--tokens", type=int, default=50_000_000_000, help="Default: 50 Billion Tokens")
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--ckpt_dir", type=str, default="checkpoints_1b_stream")
     parser.add_argument("--output", type=str, default="production_slm_1b/bitnet_1b_pretrained.pt")
     args = parser.parse_args()
 
-    run_1b_spectral_inversion(tokens=args.tokens, batch_size=args.batch_size, workers=args.workers, output_file=args.output)
+    run_1b_spectral_inversion(tokens=args.tokens, batch_size=args.batch_size, workers=args.workers,
+                              ckpt_dir=args.ckpt_dir, output_file=args.output)

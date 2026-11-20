@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Master Pipeline: 1 Billion Parameter Production SLM
-# Stage 1: High-Volume Pretraining (10BT to 25BT) via Streaming Spectral Inversion (~2.5 - 6 hrs)
-# Stage 2: SFT / Dialogue Alignment on Conversational ChatML (~45 mins)
+# Master Pipeline: 1 Billion Parameter Production SLM (50 Billion Tokens)
+# Stage 1: 50BT High-Volume Pre-training with Auto-Checkpointing & Recovery (~12.6 hrs)
+# Stage 2: SFT / Dialogue Alignment on Conversational ChatML with Auto-Recovery (~1.2 hrs)
 # Stage 3: Bit-pack into 260MB edge binary for instant local CPU chat
 # ==============================================================================
 set -e
@@ -27,34 +27,37 @@ select_idle_gpu() {
 
 select_idle_gpu
 
-TOKENS="${1:-10000000000}"   # 10 Billion Tokens by default
-SFT_STEPS="${2:-2500}"        # Dialogue tuning steps
+# Default: Full 50 Billion Tokens
+TOKENS="${1:-50000000000}"
+SFT_STEPS="${2:-5000}"
 
 echo "=================================================================="
 echo " 1 Billion Parameter Production SLM Pipeline"
-echo " Pre-training Target Tokens : $TOKENS"
-echo " Dialogue Tuning Steps      : $SFT_STEPS"
+echo " Pre-training Target Tokens : $TOKENS (50 Billion Tokens)"
+echo " Dialogue Tuning Steps      : $SFT_STEPS (5,000 steps)"
 echo " CUDA_VISIBLE_DEVICES       : $CUDA_VISIBLE_DEVICES"
 echo "=================================================================="
 
 # ------------------------------------------------------------------
-# Stage 1: Spectral Pretraining across the token stream
+# Stage 1: 50BT Streaming Pre-training with Auto-Resume & Auto-Cleanup
 # ------------------------------------------------------------------
-echo "--> [Stage 1/3] Starting High-Volume 1B Spectral Pre-training..."
+echo "--> [Stage 1/3] Starting 50BT Spectral Pre-training (Auto-resumes if interrupted)..."
 python3 train_1b_spectral_stream.py \
     --tokens "$TOKENS" \
     --batch_size 128 \
     --workers 8 \
+    --ckpt_dir "checkpoints_1b_stream" \
     --output "bitnet_1b_pretrained.pt"
 
 # ------------------------------------------------------------------
-# Stage 2: Dialogue Instruction Tuning (ChatML Alignment)
+# Stage 2: Dialogue Instruction Tuning with Auto-Resume
 # ------------------------------------------------------------------
 echo "--> [Stage 2/3] Starting Dialogue Instruction Tuning..."
 python3 tune_1b_dialogue.py \
     --base_ckpt "bitnet_1b_pretrained.pt" \
     --steps "$SFT_STEPS" \
     --batch_size 16 \
+    --ckpt_dir "checkpoints_1b_sft" \
     --output "bitnet_1b_dialogue_chat.pt"
 
 # ------------------------------------------------------------------
