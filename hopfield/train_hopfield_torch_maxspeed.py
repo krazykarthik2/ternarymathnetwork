@@ -30,7 +30,7 @@ if torch.cuda.is_available():
     torch.set_float32_matmul_precision('high')
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from hopfield_bitnet import HopfieldBitNet125M, HopfieldBitAttention, BitFeedForward, RMSNorm
+from hopfield_bitnet import HopfieldBitNet125M, HopfieldBitAttention, HopfieldBitFeedForward, RMSNorm
 from quantizers import temp_anneal_quantize
 
 
