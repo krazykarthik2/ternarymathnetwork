@@ -125,11 +125,11 @@ def run_production_laplacian_training(target_tokens=10_000_000_000, batch_size=2
     dataset = FastStreamingDataset("HuggingFaceFW/fineweb-edu", "sample-10BT", seq_len=seq_len)
     loader = DataLoader(
         dataset,
-        batch_size=args.batch_size,
-        num_workers=args.workers if torch.cuda.is_available() else 0,
+        batch_size=batch_size,
+        num_workers=workers if torch.cuda.is_available() else 0,
         pin_memory=torch.cuda.is_available(),
-        persistent_workers=(args.workers > 0 and torch.cuda.is_available()),
-        prefetch_factor=2 if (args.workers > 0 and torch.cuda.is_available()) else None
+        persistent_workers=(workers > 0 and torch.cuda.is_available()),
+        prefetch_factor=2 if (workers > 0 and torch.cuda.is_available()) else None
     )
 
     # Initialize Global Covariance and Laplacian Accumulators in GPU VRAM
@@ -156,20 +156,20 @@ def run_production_laplacian_training(target_tokens=10_000_000_000, batch_size=2
 
         with torch.no_grad():
             pos = torch.arange(0, x.size(1), device=device).unsqueeze(0)
-            h_x = (model.tok_embeddings(x) + model.pos_embeddings(pos)).view(-1, D).float()
-            h_y = (model.tok_embeddings(y) + model.pos_embeddings(pos)).view(-1, D).float()
+            h_x = (model.tok_embeddings(x) + model.pos_embeddings(pos)).view(-1, D)
+            h_y = (model.tok_embeddings(y) + model.pos_embeddings(pos)).view(-1, D)
 
-            # Additive covariance: C_xx = sum(h_x^T h_x), C_yx = sum(h_y^T h_x)
+            # Accumulate covariance in half-precision / bfloat16 to cut VRAM in half
             cov_xx.addmm_(h_x.t(), h_x)
             cov_yx.addmm_(h_y.t(), h_x)
 
-            # Fill pre-allocated GPU buffer directly in VRAM (runs only for the first 32 steps!)
             if sample_count < 2048:
                 n_take = min(64, 2048 - sample_count)
                 sample_pool_gpu[sample_count:sample_count + n_take].copy_(h_x[:n_take])
                 sample_count += n_take
 
-            del h_x, h_y, pos
+            del h_x, h_y, pos, x, y
+            torch.cuda.empty_cache()
 
         now = time.time()
         if now - last_report_time >= 10.0:
