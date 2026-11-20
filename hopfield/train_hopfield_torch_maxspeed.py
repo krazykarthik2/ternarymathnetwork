@@ -125,12 +125,14 @@ def main():
 
     # Optional torch.compile for graph fusion
     if args.compile and torch.cuda.is_available() and hasattr(torch, "compile"):
-        print("--> Compiling model with torch.compile(mode='reduce-overhead')...")
-        try:
-            model = torch.compile(model, mode="reduce-overhead")
-            print("--> Compilation succeeded!")
-        except Exception as e:
-            print(f"--> torch.compile fallback: {e}")
+        # We compile the FlashAttention submodule which holds all matmuls and SDPA
+        print("--> Compiling FastFlashAttention layers with torch.compile...")
+        for i, layer in enumerate(model.layers):
+            try:
+                layer.attn = torch.compile(layer.attn)
+            except Exception as e:
+                print(f"--> Layer {i} compile fallback: {e}")
+        print("--> Attention compilation ready!")
 
     # Multi-worker asynchronous PyTorch DataLoader
     dataset = FastStreamingDataset("HuggingFaceFW/fineweb-edu", "sample-10BT", seq_len=args.seq_len)
@@ -178,7 +180,7 @@ def main():
         T_val = 0.01 + 0.5 * (1.0 - 0.01) * (1.0 + math.cos(math.pi * tau))
 
         optimizer.zero_grad(set_to_none=True)
-        with torch.cuda.amp.autocast(enabled=use_amp, dtype=dtype):
+        with torch.amp.autocast('cuda', enabled=use_amp, dtype=dtype):
             logits = model(x, T=T_val)
             loss = criterion(logits.view(-1, 50257), y.view(-1))
 

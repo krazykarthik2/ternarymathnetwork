@@ -53,9 +53,9 @@ class TempAnnealQuantizeFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, w: torch.Tensor, T: float, threshold: float = 0.5) -> torch.Tensor:
         ctx.save_for_backward(w)
-        ctx.T = float(T)
-        ctx.threshold = float(threshold)
-        return soft_ternary(w, T, threshold)
+        ctx.T = T if isinstance(T, float) else float(T)
+        ctx.threshold = threshold if isinstance(threshold, float) else float(threshold)
+        return soft_ternary(w, ctx.T, ctx.threshold)
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
