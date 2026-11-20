@@ -50,19 +50,25 @@ def soft_ternary_derivative(w: torch.Tensor, T: float, threshold: float = 0.5) -
     d_neg = (1.0 / T) * s_neg * (1.0 - s_neg)
     return d_pos + d_neg
 
-class TempAnnealQuantizeFunction(torch.autograd.Function):
+class STEAnnealQuantize(torch.autograd.Function):
     @staticmethod
     def forward(ctx, w: torch.Tensor, T: float, threshold: float = 0.5) -> torch.Tensor:
         ctx.save_for_backward(w)
-        ctx.T = T if isinstance(T, float) else float(T)
-        ctx.threshold = threshold if isinstance(threshold, float) else float(threshold)
-        return soft_ternary(w, ctx.T, ctx.threshold)
+        # Forward: Smooth continuous relaxation that snaps to exact ternary as T -> 0
+        s_pos = torch.sigmoid((w - threshold) / T)
+        s_neg = torch.sigmoid((w + threshold) / T)
+        return s_pos + s_neg - 1.0
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         (w,) = ctx.saved_tensors
-        d_Q = soft_ternary_derivative(w, ctx.T, ctx.threshold)
-        return grad_output * d_Q, None, None
+        # Backward: Straight-Through gradient flow with floor!
+        # Prevents sigmoid derivative from dying at 1e-12 when T cools down!
+        mask = (w.abs() <= 1.2).to(grad_output.dtype)
+        return grad_output * mask, None, None
+
+def soft_ternary_ste(w: torch.Tensor, T: float, threshold: float = 0.5) -> torch.Tensor:
+    return STEAnnealQuantize.apply(w, T, threshold)
 
 def temp_anneal_quantize(w: torch.Tensor, T: float, threshold: float = 0.5) -> torch.Tensor:
     return TempAnnealQuantizeFunction.apply(w, T, threshold)

@@ -120,9 +120,9 @@ class HopfieldBitLinear(nn.Module):
         w_norm = self.weight / gamma
 
         if self.method in ("temp_anneal", "ta"):
-            from quantizers import soft_ternary
-            # Pure tensor math: 100% TorchDynamo / Triton compilable without autograd.Function errors
-            w_q = soft_ternary(w_norm, T=T, threshold=0.5)
+            from quantizers import soft_ternary_ste
+            # Smooth forward snapping to {-1, 0, 1} with STE gradient preservation
+            w_q = soft_ternary_ste(w_norm, T=T, threshold=0.5)
         elif self.method in ("mige_ta", "migeta"):
             w_q = mige_ta_quantize(w_norm, T=T, threshold=0.5, floor_grad=self.floor_grad)
         elif self.method == "ste":
