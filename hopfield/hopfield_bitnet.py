@@ -280,10 +280,9 @@ class HopfieldBitNet125M(nn.Module):
             layer.ffn.up_proj.weight.copy_(w_ternary_ffn)
             layer.ffn.down_proj.weight.copy_(w_ternary_ffn.t()[:d_in, :d_out])
 
-        # 4. Tie / Calculate output head directly from token embeddings!
-        # Head maps dim (768) -> vocab_size (50257).
-        # In language modeling, output_head = tok_embeddings.weight (tied weights)
-        self.output_head.weight.copy_(self.tok_embeddings.weight)
+        # Proper normalization scale for LM head projection: scale by 1 / sqrt(dim)
+        # Prevents logit explosion and keeps cross-entropy loss bounded
+        self.output_head.weight.copy_(self.tok_embeddings.weight / math.sqrt(self.dim))
 
     def forward(self, input_ids: torch.Tensor, T: float = 1.0, epsilon: float = 0.25) -> torch.Tensor:
         B, S = input_ids.shape
