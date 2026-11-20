@@ -2,12 +2,14 @@
 Publication Chart Generator:
 Renders results/obj6_mige_beats_all.png and updates results/final_evaluation_results.json
 to include all completed 10,000-step BitNet-125M paradigms:
-1. TSGO (Ternary Swarm-Guided Optimization)
-2. Temperature Annealing
-3. MIGE-1 (Adaptive Sobolev)
-4. STE Baseline
-5. MIGE-NBS (Normalized Bounded-Sobolev)
-6. MIGE-v2 (Gaussian Proximity Halo - Historical Ablation)
+1. Temperature Annealing
+2. MIGE-1 (Adaptive Sobolev)
+3. STE Baseline
+4. MIGE-v2 (Gaussian Proximity Halo)
+5. MIGE-TA (Mollified Temp Anneal)
+6. MIGE-HC (Homotopy Sobolev)
+7. MIGE-NBS (Normalized Bounded-Sobolev)
+8. TSGO (Ternary Swarm)
 """
 import os
 import json
@@ -35,6 +37,8 @@ def update_comparison_charts():
     migenbs_p = "checkpoints/125M_mige_nbs/metrics.json"
     migev2_p = "checkpoints/125M_mige_v2/metrics.json"
     tsgo_p = "checkpoints/125M_tsgo/metrics.json"
+    migehc_p = "checkpoints/125M_mige_hc/metrics.json"
+    migeta_p = "checkpoints/125M_mige_ta/metrics.json"
 
     metrics = {}
     if os.path.exists(ste_p):
@@ -49,39 +53,49 @@ def update_comparison_charts():
         with open(migev2_p) as f: metrics["MIGE-v2"] = json.load(f)
     if os.path.exists(tsgo_p):
         with open(tsgo_p) as f: metrics["TSGO"] = json.load(f)
+    if os.path.exists(migehc_p):
+        with open(migehc_p) as f: metrics["MIGE-HC"] = json.load(f)
+    if os.path.exists(migeta_p):
+        with open(migeta_p) as f: metrics["MIGE-TA"] = json.load(f)
 
     # 3. Render 4-panel publication comparison plot
-    fig, axes = plt.subplots(2, 2, figsize=(18, 12))
+    fig, axes = plt.subplots(2, 2, figsize=(20, 13))
     colors = {
-        "TSGO (Ternary Swarm, Step 10,000)": "#8e44ad",
         "Temperature Annealing (Step 10,000)": "#f39c12",
-        "MIGE (Adaptive Sobolev, Step 10,000)": "#3498db",
+        "MIGE (Adaptive Sobolev, Step 10,000)": "#2980b9",
         "STE Baseline (Step 10,000)": "#e74c3c",
-        "MIGE-NBS (Normalized Bounded-Sobolev, Step 10,000)": "#2ecc71",
-        "MIGE-v2 (Gaussian Proximity Halo, Step 10,000)": "#95a5a6"
+        "MIGE-v2 (Gaussian Proximity Halo, Step 10,000)": "#95a5a6",
+        "MIGE-TA (Mollified Temp Anneal, Step 10,000)": "#d35400",
+        "MIGE-HC (Homotopy Sobolev, Step 10,000)": "#16a085",
+        "MIGE-NBS (Normalized Bounded-Sobolev, Step 10,000)": "#27ae60",
+        "TSGO (Ternary Swarm, Step 10,000)": "#8e44ad"
     }
     short_names = {
-        "TSGO (Ternary Swarm, Step 10,000)": "TSGO (Ours)",
         "Temperature Annealing (Step 10,000)": "Temp Anneal",
-        "MIGE (Adaptive Sobolev, Step 10,000)": "MIGE-1",
+        "MIGE (Adaptive Sobolev, Step 10,000)": "MIGE-1 (Ours)",
         "STE Baseline (Step 10,000)": "STE",
+        "MIGE-v2 (Gaussian Proximity Halo, Step 10,000)": "MIGE-v2",
+        "MIGE-TA (Mollified Temp Anneal, Step 10,000)": "MIGE-TA",
+        "MIGE-HC (Homotopy Sobolev, Step 10,000)": "MIGE-HC",
         "MIGE-NBS (Normalized Bounded-Sobolev, Step 10,000)": "MIGE-NBS",
-        "MIGE-v2 (Gaussian Proximity Halo, Step 10,000)": "MIGE-v2"
+        "TSGO (Ternary Swarm, Step 10,000)": "TSGO"
     }
 
     # Panel 1: Hardware Discrete PPL Curve
     ax1 = axes[0, 0]
     has_curves = False
-    for k, name in [("TSGO", "TSGO (Ternary Swarm, Step 10,000)"),
-                    ("Temp Anneal", "Temperature Annealing (Step 10,000)"), 
+    for k, name in [("Temp Anneal", "Temperature Annealing (Step 10,000)"), 
                     ("MIGE-1", "MIGE (Adaptive Sobolev, Step 10,000)"),
                     ("STE", "STE Baseline (Step 10,000)"),
+                    ("MIGE-TA", "MIGE-TA (Mollified Temp Anneal, Step 10,000)"),
+                    ("MIGE-HC", "MIGE-HC (Homotopy Sobolev, Step 10,000)"),
                     ("MIGE-NBS", "MIGE-NBS (Normalized Bounded-Sobolev, Step 10,000)"),
+                    ("TSGO", "TSGO (Ternary Swarm, Step 10,000)"),
                     ("MIGE-v2", "MIGE-v2 (Gaussian Proximity Halo, Step 10,000)")]:
         if k in metrics:
             has_curves = True
             m = metrics[k]
-            lw = 3.0 if k == "TSGO" else 2.0
+            lw = 3.2 if k == "MIGE-1" else 2.0
             ax1.plot(m["steps"], m["discrete_ppl"], label=f"{k} (Final: {m['discrete_ppl'][-1]:.1f})", color=colors[name], lw=lw)
 
     if not has_curves and eval_data:
@@ -97,20 +111,21 @@ def update_comparison_charts():
     ax1.set_ylabel("Discrete Test Perplexity (Lower is Better)", fontsize=11)
     if has_curves:
         ax1.set_yscale("log")
-        ax1.legend(loc="upper right", fontsize=10)
+        ax1.legend(loc="upper right", fontsize=9)
     ax1.grid(True, alpha=0.3)
 
     # Panel 2: Discretization Gap Dynamics
     ax2 = axes[0, 1]
     has_gap = False
-    for k, name in [("TSGO", "TSGO (Ternary Swarm, Step 10,000)"),
-                    ("Temp Anneal", "Temperature Annealing (Step 10,000)"), 
+    for k, name in [("Temp Anneal", "Temperature Annealing (Step 10,000)"), 
                     ("MIGE-1", "MIGE (Adaptive Sobolev, Step 10,000)"),
-                    ("STE", "STE Baseline (Step 10,000)")]:
+                    ("STE", "STE Baseline (Step 10,000)"),
+                    ("MIGE-TA", "MIGE-TA (Mollified Temp Anneal, Step 10,000)"),
+                    ("MIGE-HC", "MIGE-HC (Homotopy Sobolev, Step 10,000)")]:
         if k in metrics:
             has_gap = True
             m = metrics[k]
-            lw = 2.8 if k == "TSGO" else 1.8
+            lw = 3.0 if k == "MIGE-1" else 1.8
             ax2.plot(m["steps"], m["discretization_gap"], label=f"{k} Gap", color=colors[name], lw=lw)
     if not has_gap:
         ax2.text(0.5, 0.5, "Discretization Gap Dynamics", 
@@ -120,19 +135,21 @@ def update_comparison_charts():
     ax2.set_ylabel("Discretization Gap", fontsize=11)
     ax2.axhline(0, color="black", linestyle="--", alpha=0.5)
     if has_gap:
-        ax2.legend(loc="upper right", fontsize=10)
+        ax2.legend(loc="upper right", fontsize=9)
         ax2.set_ylim(-150, 1300)
     ax2.grid(True, alpha=0.3)
 
     # Panel 3: Held-out Benchmark (Step 10,000)
     ax3 = axes[1, 0]
     candidate_keys = [
-        "TSGO (Ternary Swarm, Step 10,000)",
         "Temperature Annealing (Step 10,000)",
         "MIGE (Adaptive Sobolev, Step 10,000)",
         "STE Baseline (Step 10,000)",
+        "MIGE-v2 (Gaussian Proximity Halo, Step 10,000)",
+        "MIGE-HC (Homotopy Sobolev, Step 10,000)",
+        "MIGE-TA (Mollified Temp Anneal, Step 10,000)",
         "MIGE-NBS (Normalized Bounded-Sobolev, Step 10,000)",
-        "MIGE-v2 (Gaussian Proximity Halo, Step 10,000)"
+        "TSGO (Ternary Swarm, Step 10,000)"
     ]
     keys = [k for k in candidate_keys if k in eval_data]
     labels = [short_names[k] for k in keys]
@@ -140,12 +157,13 @@ def update_comparison_charts():
     c_list = [colors[k] for k in keys]
 
     if keys:
-        bars = ax3.bar(labels, ppl_vals, color=c_list, width=0.55, edgecolor="black", linewidth=1.2)
+        bars = ax3.bar(labels, ppl_vals, color=c_list, width=0.6, edgecolor="black", linewidth=1.2)
         ax3.set_title("(c) Held-Out FineWeb-Edu Benchmark (245k Tokens)", fontsize=13, fontweight="bold")
         ax3.set_ylabel("Discrete Test Perplexity (Lower is Better)", fontsize=11)
+        ax3.tick_params(axis='x', rotation=25)
         ax3.grid(axis="y", alpha=0.3)
         for b, val in zip(bars, ppl_vals):
-            ax3.text(b.get_x() + b.get_width()/2.0, val + 1.5, f"{val:.2f}", ha="center", va="bottom", fontsize=11, fontweight="bold")
+            ax3.text(b.get_x() + b.get_width()/2.0, val + 1.5, f"{val:.2f}", ha="center", va="bottom", fontsize=10, fontweight="bold")
 
     # Panel 4: Ternary Parameter Distribution (Sparsity Allocation)
     ax4 = axes[1, 1]
@@ -164,7 +182,7 @@ def update_comparison_charts():
         ax4.set_xticklabels(["State -1", "State 0 (Sparsity)", "State +1"], fontsize=11, fontweight="bold")
         ax4.set_ylabel("Weight Fraction (%)", fontsize=11)
         ax4.set_title("(d) Quantized Parameter Allocation Across States", fontsize=13, fontweight="bold")
-        ax4.legend(loc="upper right", fontsize=10)
+        ax4.legend(loc="upper right", fontsize=8)
         ax4.grid(axis="y", alpha=0.3)
 
     plt.tight_layout()
