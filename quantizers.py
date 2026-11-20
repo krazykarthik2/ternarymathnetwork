@@ -32,7 +32,8 @@ def ste_quantize(w: torch.Tensor, threshold: float = 0.5, clip_val: float = 1.0)
 def soft_ternary(w: torch.Tensor, T: float, threshold: float = 0.5) -> torch.Tensor:
     """
     Temperature-parameterized smooth ternary quantizer:
-    Q_T(w) = sigma((w + threshold)/T) + sigma((w - threshold)/T) - 1
+    Q_T(w) = sigma((w - threshold)/T) + sigma((w + threshold)/T) - 1.0
+    100% TorchScript & TorchDynamo compilable (pure tensor operations).
     """
     s_pos = torch.sigmoid((w - threshold) / T)
     s_neg = torch.sigmoid((w + threshold) / T)
