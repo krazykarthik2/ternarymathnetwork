@@ -280,8 +280,10 @@ class HopfieldBitNet125M(nn.Module):
             layer.ffn.up_proj.weight.copy_(w_ternary_ffn)
             layer.ffn.down_proj.weight.copy_(w_ternary_ffn.t()[:d_in, :d_out])
 
-            # 3. Hopfield associative memory unit
-            layer.hopfield_mem.calculate_weights_single_shot(flat_h[:min(1024, N)])
+        # 4. Tie / Calculate output head directly from token embeddings!
+        # Head maps dim (768) -> vocab_size (50257).
+        # In language modeling, output_head = tok_embeddings.weight (tied weights)
+        self.output_head.weight.copy_(self.tok_embeddings.weight)
 
     def forward(self, input_ids: torch.Tensor, T: float = 1.0, epsilon: float = 0.25) -> torch.Tensor:
         B, S = input_ids.shape
