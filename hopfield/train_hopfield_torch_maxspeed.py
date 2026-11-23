@@ -88,21 +88,23 @@ class FastStreamingDataset(IterableDataset):
             total_shards = self.world_size
             shard_id = self.rank
 
-        # Approximate tokens skipped per stream
-        skipped = 0
+        # Estimate how many dataset rows to skip (avg ~800 tokens per document)
+        skip_rows_per_shard = (self.skip_tokens // 800) // total_shards if self.skip_tokens > 0 else 0
+
         token_buf = []
         for idx, item in enumerate(ds):
             if total_shards > 1 and (idx % total_shards != shard_id):
                 continue
+
+            # Instant O(1) row skipping without tokenizing!
+            if skip_rows_per_shard > 0:
+                skip_rows_per_shard -= 1
+                continue
+
             text = item.get("text", "")
             if not text:
                 continue
             tokens = tokenizer.encode(text)
-            
-            # Fast skip over already seen tokens upon resume
-            if self.skip_tokens > 0 and skipped < self.skip_tokens:
-                skipped += len(tokens) * total_shards
-                continue
 
             token_buf.extend(tokens)
             while len(token_buf) >= self.seq_len + 1:
