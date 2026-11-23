@@ -60,7 +60,7 @@ class FastFlashAttention(nn.Module):
 
 
 class FastStreamingDataset(IterableDataset):
-    """High-throughput multi-worker streaming dataset for PyTorch DataLoader."""
+    """High-throughput multi-worker streaming dataset with instant shard skipping."""
     def __init__(self, dataset_name, subset, seq_len=512, rank=0, world_size=1, skip_tokens=0):
         self.dataset_name = dataset_name
         self.subset = subset
@@ -75,12 +75,26 @@ class FastStreamingDataset(IterableDataset):
         tokenizer = AutoTokenizer.from_pretrained("gpt2")
         worker_info = torch.utils.data.get_worker_info()
 
+        # Calculate exact parquet shard to start from to avoid streaming already-seen files
+        # FineWeb-Edu 100BT has 140 shards (~714M tokens each)
+        start_shard_idx = 0
+        if self.skip_tokens > 0:
+            tokens_per_shard = 714_000_000
+            start_shard_idx = min(int(self.skip_tokens // tokens_per_shard), 139)
+
         if self.subset:
             ds = load_dataset(self.dataset_name, name=self.subset, split="train", streaming=True)
         else:
             ds = load_dataset(self.dataset_name, split="train", streaming=True)
 
-        # Calculate combined worker index across multi-GPU ranks
+        # Skip already-processed parquet shards directly at the dataset container level!
+        if start_shard_idx > 0 and hasattr(ds, "_shards"):
+            try:
+                ds._shards = ds._shards[start_shard_idx:]
+            except Exception:
+                pass
+
+        # Calculate worker shard index
         if worker_info is not None:
             total_shards = self.world_size * worker_info.num_workers
             shard_id = self.rank * worker_info.num_workers + worker_info.id
@@ -88,17 +102,9 @@ class FastStreamingDataset(IterableDataset):
             total_shards = self.world_size
             shard_id = self.rank
 
-        # Estimate how many dataset rows to skip (avg ~800 tokens per document)
-        skip_rows_per_shard = (self.skip_tokens // 800) // total_shards if self.skip_tokens > 0 else 0
-
         token_buf = []
         for idx, item in enumerate(ds):
             if total_shards > 1 and (idx % total_shards != shard_id):
-                continue
-
-            # Instant O(1) row skipping without tokenizing!
-            if skip_rows_per_shard > 0:
-                skip_rows_per_shard -= 1
                 continue
 
             text = item.get("text", "")
