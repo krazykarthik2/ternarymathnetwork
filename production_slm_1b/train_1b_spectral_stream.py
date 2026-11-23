@@ -119,13 +119,14 @@ def run_1b_spectral_inversion(tokens=50_000_000_000, batch_size=128, seq_len=512
         if is_master:
             print("\n--> Starting fresh pre-training run from token 0...")
 
-    # FastStreamingDataset sharded across GPUs if distributed
+    # FastStreamingDataset sharded across GPUs if distributed, skipping past seen tokens
     dataset = FastStreamingDataset(
         "HuggingFaceFW/fineweb-edu",
         "sample-100BT",
         seq_len=seq_len,
         rank=rank,
-        world_size=world_size
+        world_size=world_size,
+        skip_tokens=total_tokens_seen
     )
 
     loader = DataLoader(

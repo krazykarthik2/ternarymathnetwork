@@ -61,12 +61,13 @@ class FastFlashAttention(nn.Module):
 
 class FastStreamingDataset(IterableDataset):
     """High-throughput multi-worker streaming dataset for PyTorch DataLoader."""
-    def __init__(self, dataset_name, subset, seq_len=512, rank=0, world_size=1):
+    def __init__(self, dataset_name, subset, seq_len=512, rank=0, world_size=1, skip_tokens=0):
         self.dataset_name = dataset_name
         self.subset = subset
         self.seq_len = seq_len
         self.rank = rank
         self.world_size = world_size
+        self.skip_tokens = skip_tokens
 
     def __iter__(self):
         from datasets import load_dataset
@@ -87,6 +88,8 @@ class FastStreamingDataset(IterableDataset):
             total_shards = self.world_size
             shard_id = self.rank
 
+        # Approximate tokens skipped per stream
+        skipped = 0
         token_buf = []
         for idx, item in enumerate(ds):
             if total_shards > 1 and (idx % total_shards != shard_id):
@@ -94,7 +97,14 @@ class FastStreamingDataset(IterableDataset):
             text = item.get("text", "")
             if not text:
                 continue
-            token_buf.extend(tokenizer.encode(text))
+            tokens = tokenizer.encode(text)
+            
+            # Fast skip over already seen tokens upon resume
+            if self.skip_tokens > 0 and skipped < self.skip_tokens:
+                skipped += len(tokens) * total_shards
+                continue
+
+            token_buf.extend(tokens)
             while len(token_buf) >= self.seq_len + 1:
                 chunk = token_buf[:self.seq_len + 1]
                 token_buf = token_buf[self.seq_len:]

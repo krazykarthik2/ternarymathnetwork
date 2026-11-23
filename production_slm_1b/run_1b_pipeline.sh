@@ -60,7 +60,7 @@ echo "--> [Stage 2/3] Starting ChatML Dialogue Instruction Tuning (Auto-resumes 
 $LAUNCH_CMD tune_1b_dialogue.py \
     --base_ckpt "bitnet_1b_pretrained.pt" \
     --steps "$SFT_STEPS" \
-    --batch_size 16 \
+    --batch_size 4 \
     --ckpt_dir "checkpoints_1b_sft" \
     --output "bitnet_1b_dialogue_chat.pt"
 

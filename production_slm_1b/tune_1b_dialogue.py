@@ -82,7 +82,8 @@ class DialogueDataset(IterableDataset):
 
             tokens = self.tokenizer.encode(text)
             if len(tokens) >= 16:
-                tokens = tokens[:self.max_len + 1]
+                # Clamp strictly to max_len to avoid any out-of-bounds positional indexing
+                tokens = tokens[:self.max_len]
                 yield (torch.tensor(tokens[:-1], dtype=torch.long),
                        torch.tensor(tokens[1:], dtype=torch.long))
 
@@ -118,6 +119,7 @@ def run_dialogue_tuning(base_ckpt="production_slm_1b/bitnet_1b_pretrained.pt", s
         print("==================================================================")
 
     model = ProductionBitNet1B(dim=2048, n_layers=24, n_heads=16, hidden_dim=5632).to(device)
+    model.gradient_checkpointing = True
 
     # Optimizer & Scheduler
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
@@ -168,7 +170,7 @@ def run_dialogue_tuning(base_ckpt="production_slm_1b/bitnet_1b_pretrained.pt", s
 
     criterion = nn.CrossEntropyLoss(ignore_index=-100)
     use_amp = torch.cuda.is_available()
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
     dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
 
     t0 = time.time()
@@ -230,7 +232,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Tune 1B BitNet on Dialogue")
     parser.add_argument("--base_ckpt", type=str, default="production_slm_1b/bitnet_1b_pretrained.pt")
     parser.add_argument("--steps", type=int, default=5000, help="Default: 5000 SFT steps")
-    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=4, help="Default: 4 (with gradient checkpointing to prevent OOM)")
     parser.add_argument("--ckpt_dir", type=str, default="checkpoints_1b_sft")
     parser.add_argument("--output", type=str, default="production_slm_1b/bitnet_1b_dialogue_chat.pt")
     args = parser.parse_args()
