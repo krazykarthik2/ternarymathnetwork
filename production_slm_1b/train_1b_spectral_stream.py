@@ -36,7 +36,7 @@ if torch.cuda.is_available():
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../hopfield")))
 from bitnet_1b_model import ProductionBitNet1B
-from train_hopfield_torch_maxspeed import FastStreamingDataset
+from dataset_stream import FastStreamingDataset
 from quantizers import hard_ternary
 
 

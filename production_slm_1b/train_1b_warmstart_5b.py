@@ -38,7 +38,7 @@ for p in [root_dir, base_dir, hopfield_dir]:
         sys.path.insert(0, p)
 
 from bitnet_1b_model import ProductionBitNet1B
-from train_hopfield_torch_maxspeed import FastStreamingDataset
+from dataset_stream import FastStreamingDataset
 
 
 def cleanup_old_checkpoints(ckpt_dir: str, keep_latest: int = 1):
