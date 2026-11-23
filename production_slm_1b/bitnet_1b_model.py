@@ -12,9 +12,16 @@ production_slm_1b/bitnet_1b_model.py
 - Packed Size: ~262 MB
 """
 import math
+import os
+import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+# Ensure root directory is in sys.path so quantizers can always be found
+root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if root_dir not in sys.path:
+    sys.path.insert(0, root_dir)
 
 from quantizers import hard_ternary
 
