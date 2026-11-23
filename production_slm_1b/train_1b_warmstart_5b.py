@@ -28,9 +28,14 @@ if torch.cuda.is_available():
     torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision('high')
 
-sys.path.insert(0, os.path.abspath("."))
-sys.path.insert(0, os.path.abspath("production_slm_1b"))
-sys.path.insert(0, os.path.abspath("hopfield"))
+# Ensure absolute paths to root and hopfield so imports work from any working directory
+base_dir = os.path.dirname(os.path.abspath(__file__))
+root_dir = os.path.abspath(os.path.join(base_dir, ".."))
+hopfield_dir = os.path.abspath(os.path.join(base_dir, "../hopfield"))
+
+for p in [root_dir, base_dir, hopfield_dir]:
+    if p not in sys.path:
+        sys.path.insert(0, p)
 
 from bitnet_1b_model import ProductionBitNet1B
 from train_hopfield_torch_maxspeed import FastStreamingDataset
