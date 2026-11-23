@@ -222,20 +222,24 @@ def run_parallel_dialogue_sft(checkpoint: str, steps: int = 5000, batch_size: in
             elapsed_min = (time.time() - t0) / 60.0
             print(f"Step {step:05d}/{steps:05d} | Loss: {loss.item():.4f} | PPL: {ppl:.2f} | LR: {cur_lr:.2e} | Elapsed: {elapsed_min:.1f}m", flush=True)
 
-        # Checkpoint every 500 steps
+        # Checkpoint every 500 steps (save in bfloat16 to keep checkpoints at ~2.1 GB instead of 15 GB)
         if step % 500 == 0 or step == steps:
             ckpt_file = os.path.join(ckpt_dir, f"dialogue_sft_step_{step}.pt")
+            # Convert model state dict to bfloat16 for compact disk footprint
+            bf16_state_dict = {k: v.to(torch.bfloat16) if v.is_floating_point() else v 
+                               for k, v in model.state_dict().items()}
             torch.save({
                 "step": step,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": scheduler.state_dict(),
+                "model_state_dict": bf16_state_dict,
                 "loss": loss.item()
             }, ckpt_file)
-            print(f"--> [Checkpoint] Saved progress at step {step} to: {ckpt_file}", flush=True)
+            print(f"--> [Checkpoint] Saved progress at step {step} (~2.1 GB) to: {ckpt_file}", flush=True)
             cleanup_old_checkpoints(ckpt_dir, keep_latest=1)
 
-    torch.save(model.state_dict(), output)
+    # Save final model in bfloat16
+    final_state_dict = {k: v.to(torch.bfloat16) if v.is_floating_point() else v 
+                        for k, v in model.state_dict().items()}
+    torch.save(final_state_dict, output)
     print("\n==================================================================", flush=True)
     print(f" Dialogue SFT Tuning Complete in {(time.time() - t0)/60:.2f} Minutes!")
     print(f" Final Fine-Tuned Model Saved to: {output}")
