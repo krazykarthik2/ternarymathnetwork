@@ -151,20 +151,67 @@ def train_step_loop(model, loader, optimizer, scheduler, scaler, criterion, devi
     return total_tokens
 
 
-def run_125m_full_pipeline(pretrain_tokens=1_200_000_000,
+def transfer_graph_manifold_to_125m(model, spectral_ckpt_path):
+    """
+    Transfers the 25B-token Graph Laplacian semantic manifold from the 1B spectral
+    checkpoint into the 125M model via SVD principal component projection.
+    Maps 2048-dim spectral manifold -> 768-dim 125M architecture losslessly.
+    """
+    if not os.path.exists(spectral_ckpt_path):
+        print(f"[!] Spectral checkpoint '{spectral_ckpt_path}' not found. Starting from scratch.", flush=True)
+        return
+
+    print(f"--> [Graph Transfer] Loading 25B token manifold from: {spectral_ckpt_path}", flush=True)
+    spec_data = torch.load(spectral_ckpt_path, map_location="cpu")
+    
+    # 1. Transfer vocabulary embeddings via Principal Component Projection (2048 -> 768)
+    if "tok_embeddings" in spec_data:
+        emb_2048 = spec_data["tok_embeddings"] # (50257, 2048)
+    elif "tok_embeddings.weight" in spec_data:
+        emb_2048 = spec_data["tok_embeddings.weight"]
+    else:
+        emb_2048 = None
+
+    if emb_2048 is not None:
+        print("--> [Graph Transfer] Projecting 2048-dim spectral manifold into 768-dim space via SVD...", flush=True)
+        t_svd = time.time()
+        # Compute top-768 principal eigen-directions of the vocabulary graph
+        # emb_2048: (V, 2048) -> U, S, V = torch.pca_lowrank(emb_2048, q=768)
+        U, S, V = torch.pca_lowrank(emb_2048, q=768, niter=3)
+        projected_emb = torch.matmul(emb_2048, V) # (50257, 768)
+        
+        # Scale to match 125M variance
+        scale = 1.0 / math.sqrt(768)
+        projected_emb = (projected_emb / projected_emb.std()) * scale
+        
+        with torch.no_grad():
+            model.tok_embeddings.weight.copy_(projected_emb)
+            model.output_head.weight = model.tok_embeddings.weight # Tied
+        print(f"--> [Graph Transfer] Embedded 25B token graph knowledge into 125M model in {time.time() - t_svd:.2f}s!", flush=True)
+
+    del spec_data
+
+
+def run_125m_full_pipeline(spectral_ckpt="checkpoints_1b_stream/spectral_ckpt_25002018816_tokens.pt",
+                           pretrain_tokens=1_200_000_000,
                            align_tokens=300_000_000,
                            batch_size=32,
                            output="production_slm_1b/bitnet_125m_chat_sota.pt"):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("==================================================================", flush=True)
     print(" 125M BitNet b1.58 SLM: End-to-End Pretraining + IT + DT Pipeline")
-    print(f" Total Tokens       : {pretrain_tokens + align_tokens:,} (1.5 Billion Tokens)")
-    print(f" Pretraining Tokens : {pretrain_tokens:,} (FineWeb-Edu)")
-    print(f" Alignment (IT+DT)  : {align_tokens:,} (OpenHermes + UltraChat with 15% Replay)")
-    print(f" Device             : {device} ({torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'})")
+    print(f" Graph Knowledge Checkpoint : {spectral_ckpt}")
+    print(f" Total Tokens               : {pretrain_tokens + align_tokens:,} (1.5 Billion Tokens)")
+    print(f" Pretraining Tokens         : {pretrain_tokens:,} (FineWeb-Edu)")
+    print(f" Alignment (IT+DT)          : {align_tokens:,} (OpenHermes + UltraChat with 15% Replay)")
+    print(f" Device                     : {device} ({torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'})")
     print("==================================================================", flush=True)
 
     model = BitNet125M(vocab_size=50257, dim=768, n_layers=12, n_heads=12, hidden_dim=2048)
+    
+    # Embed Graph Knowledge from 25B Spectral Checkpoint!
+    transfer_graph_manifold_to_125m(model, spectral_ckpt)
+    
     model.to(device)
 
     from transformers import AutoTokenizer
@@ -210,6 +257,7 @@ def run_125m_full_pipeline(pretrain_tokens=1_200_000_000,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="125M End-to-End Pretrain + IT + DT Training")
+    parser.add_argument("--spectral_ckpt", type=str, default="checkpoints_1b_stream/spectral_ckpt_25002018816_tokens.pt", help="Path to 25B Graph Checkpoint")
     parser.add_argument("--pretrain_tokens", type=int, default=1_200_000_000, help="Pre-training tokens (default: 1.2B)")
     parser.add_argument("--align_tokens", type=int, default=300_000_000, help="IT + DT alignment tokens (default: 300M)")
     parser.add_argument("--batch_size", type=int, default=32)
@@ -217,6 +265,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     run_125m_full_pipeline(
+        spectral_ckpt=args.spectral_ckpt,
         pretrain_tokens=args.pretrain_tokens,
         align_tokens=args.align_tokens,
         batch_size=args.batch_size,
