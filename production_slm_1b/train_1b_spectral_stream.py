@@ -143,68 +143,91 @@ def run_1b_spectral_inversion(tokens=50_000_000_000, batch_size=128, seq_len=512
     last_report_tokens = total_tokens_seen
     last_ckpt_tokens = total_tokens_seen
 
+    # Ingest tokens via loop that guarantees reaching 100% of target tokens
     if is_master:
-        print("\n[Stage 1] Ingesting tokens via streaming covariance accumulation...")
+        print(f"\n[Stage 1] Ingesting tokens via streaming covariance accumulation (Guaranteed 100% -> {tokens:,} tokens)...")
 
-    for bx, by in loader:
-        x = bx.to(device, non_blocking=True)
-        y = by.to(device, non_blocking=True)
+    while total_tokens_seen < tokens:
+        for bx, by in loader:
+            x = bx.to(device, non_blocking=True)
+            y = by.to(device, non_blocking=True)
 
-        batch_tokens = x.numel() * world_size
-        total_tokens_seen += batch_tokens
+            batch_tokens = x.numel() * world_size
+            total_tokens_seen += batch_tokens
 
-        with torch.no_grad():
-            pos = torch.arange(0, x.size(1), device=device).unsqueeze(0)
-            h_x = (model.tok_embeddings(x) + model.pos_embeddings(pos)).view(-1, D)
-            h_y = (model.tok_embeddings(y) + model.pos_embeddings(pos)).view(-1, D)
+            with torch.no_grad():
+                pos = torch.arange(0, x.size(1), device=device).unsqueeze(0)
+                h_x = (model.tok_embeddings(x) + model.pos_embeddings(pos)).view(-1, D)
+                h_y = (model.tok_embeddings(y) + model.pos_embeddings(pos)).view(-1, D)
 
-            local_cov_xx.addmm_(h_x.t(), h_x)
-            local_cov_yx.addmm_(h_y.t(), h_x)
+                local_cov_xx.addmm_(h_x.t(), h_x)
+                local_cov_yx.addmm_(h_y.t(), h_x)
 
-            del h_x, h_y, pos, x, y
+                del h_x, h_y, pos, x, y
 
-        now = time.time()
-        if now - last_report_time >= 15.0 and is_master:
-            elapsed = now - t0
-            interval_speed = (total_tokens_seen - last_report_tokens) / max(now - last_report_time, 1e-4)
-            avg_speed = (total_tokens_seen - last_ckpt_tokens) / max(elapsed, 1e-4)
-            eta_sec = (tokens - total_tokens_seen) / max(avg_speed, 1.0)
-            pct = (total_tokens_seen / tokens) * 100.0
+            now = time.time()
+            if now - last_report_time >= 15.0 and is_master:
+                elapsed = now - t0
+                interval_speed = (total_tokens_seen - last_report_tokens) / max(now - last_report_time, 1e-4)
+                avg_speed = (total_tokens_seen - last_ckpt_tokens) / max(elapsed, 1e-4)
+                eta_sec = (tokens - total_tokens_seen) / max(avg_speed, 1.0)
+                pct = (total_tokens_seen / tokens) * 100.0
 
-            norm_cxx = (local_cov_xx * world_size) / max(1.0, float(total_tokens_seen))
-            norm_cyx = (local_cov_yx * world_size) / max(1.0, float(total_tokens_seen))
-            approx_loss = 3.0 + min(7.0, (norm_cxx.trace() - 2.0 * norm_cyx.trace()).abs().item() * 0.02)
-            ppl = math.exp(min(approx_loss, 20.0))
+                norm_cxx = (local_cov_xx * world_size) / max(1.0, float(total_tokens_seen))
+                norm_cyx = (local_cov_yx * world_size) / max(1.0, float(total_tokens_seen))
+                approx_loss = 3.0 + min(7.0, (norm_cxx.trace() - 2.0 * norm_cyx.trace()).abs().item() * 0.02)
+                ppl = math.exp(min(approx_loss, 20.0))
 
-            print(f"[{pct:5.2f}%] Tokens: {total_tokens_seen:,}/{tokens:,} | Loss: {approx_loss:.4f} | PPL: {ppl:.2f} | Speed: {interval_speed:,.0f} tok/s | Elapsed: {elapsed/60:.1f}m | ETA: {eta_sec/60:.1f}m")
-            last_report_time = now
-            last_report_tokens = total_tokens_seen
+                print(f"[{pct:5.2f}%] Tokens: {total_tokens_seen:,}/{tokens:,} | Loss: {approx_loss:.4f} | PPL: {ppl:.2f} | Speed: {interval_speed:,.0f} tok/s | Elapsed: {elapsed/60:.1f}m | ETA: {eta_sec/60:.1f}m")
+                last_report_time = now
+                last_report_tokens = total_tokens_seen
 
-        # Periodic Auto-Checkpointing & Old Checkpoint Pruning
-        if total_tokens_seen - last_ckpt_tokens >= ckpt_interval_tokens:
-            global_cov_xx = local_cov_xx.clone()
-            global_cov_yx = local_cov_yx.clone()
+            # Periodic Auto-Checkpointing & Old Checkpoint Pruning
+            if total_tokens_seen - last_ckpt_tokens >= ckpt_interval_tokens:
+                global_cov_xx = local_cov_xx.clone()
+                global_cov_yx = local_cov_yx.clone()
 
-            if is_distributed:
-                dist.all_reduce(global_cov_xx, op=dist.ReduceOp.SUM)
-                dist.all_reduce(global_cov_yx, op=dist.ReduceOp.SUM)
+                if is_distributed:
+                    dist.all_reduce(global_cov_xx, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(global_cov_yx, op=dist.ReduceOp.SUM)
 
+                if is_master:
+                    ckpt_path = os.path.join(ckpt_dir, f"spectral_ckpt_{total_tokens_seen}_tokens.pt")
+                    torch.save({
+                        "tokens_seen": total_tokens_seen,
+                        "cov_xx": global_cov_xx.cpu(),
+                        "cov_yx": global_cov_yx.cpu(),
+                        "tok_embeddings": model.tok_embeddings.weight.data.cpu()
+                    }, ckpt_path)
+                    print(f"--> [Checkpoint] Saved progress at {total_tokens_seen:,} tokens to: {ckpt_path}")
+                    cleanup_old_checkpoints(ckpt_dir, keep_latest=1)
+
+                del global_cov_xx, global_cov_yx
+                last_ckpt_tokens = total_tokens_seen
+
+            if total_tokens_seen >= tokens:
+                break
+        
+        # If loader finished shards before 100%, re-initialize dataset stream to finish remaining tokens
+        if total_tokens_seen < tokens:
             if is_master:
-                ckpt_path = os.path.join(ckpt_dir, f"spectral_ckpt_{total_tokens_seen}_tokens.pt")
-                torch.save({
-                    "tokens_seen": total_tokens_seen,
-                    "cov_xx": global_cov_xx.cpu(),
-                    "cov_yx": global_cov_yx.cpu(),
-                    "tok_embeddings": model.tok_embeddings.weight.data.cpu()
-                }, ckpt_path)
-                print(f"--> [Checkpoint] Saved progress at {total_tokens_seen:,} tokens to: {ckpt_path}")
-                cleanup_old_checkpoints(ckpt_dir, keep_latest=1)
-
-            del global_cov_xx, global_cov_yx
-            last_ckpt_tokens = total_tokens_seen
-
-        if total_tokens_seen >= tokens:
-            break
+                print(f"--> [Stream] Re-seeding data stream to guarantee 100% completion ({total_tokens_seen:,}/{tokens:,} tokens)...", flush=True)
+            dataset = FastStreamingDataset(
+                "HuggingFaceFW/fineweb-edu",
+                "sample-100BT",
+                seq_len=seq_len,
+                rank=rank,
+                world_size=world_size,
+                skip_tokens=total_tokens_seen
+            )
+            loader = DataLoader(
+                dataset,
+                batch_size=batch_size,
+                num_workers=workers if torch.cuda.is_available() else 0,
+                pin_memory=torch.cuda.is_available(),
+                persistent_workers=(workers > 0 and torch.cuda.is_available()),
+                prefetch_factor=2 if (workers > 0 and torch.cuda.is_available()) else None
+            )
 
     # Final Synchronize
     global_cov_xx = local_cov_xx.clone()
