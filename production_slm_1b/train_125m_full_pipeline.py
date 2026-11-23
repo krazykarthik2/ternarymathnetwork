@@ -99,17 +99,39 @@ class MixedInstructionDialogueDataset(IterableDataset):
                        torch.tensor(tokens[1:], dtype=torch.long))
 
 
+def cleanup_old_125m_checkpoints(ckpt_dir: str, keep_latest: int = 1):
+    pattern = os.path.join(ckpt_dir, "ckpt_125m_*.pt")
+    ckpts = sorted(glob.glob(pattern), key=os.path.getmtime)
+    if len(ckpts) > keep_latest:
+        for old in ckpts[:-keep_latest]:
+            try:
+                os.remove(old)
+                print(f"--> [Auto-Cleanup] Deleted older checkpoint: {os.path.basename(old)}", flush=True)
+            except Exception as e:
+                print(f"[!] Warning deleting {old}: {e}", flush=True)
+
+
+def find_latest_125m_checkpoint(ckpt_dir: str):
+    pattern = os.path.join(ckpt_dir, "ckpt_125m_*.pt")
+    ckpts = sorted(glob.glob(pattern), key=os.path.getmtime)
+    return ckpts[-1] if ckpts else None
+
+
 def train_step_loop(model, loader, optimizer, scheduler, scaler, criterion, device,
-                    target_tokens, stage_name, start_seen=0, report_interval=50):
+                    target_tokens, stage_name, ckpt_dir="checkpoints_125m_pipeline",
+                    start_seen=0, report_interval=50, ckpt_interval=200_000_000):
+    os.makedirs(ckpt_dir, exist_ok=True)
     model.train()
     total_tokens = start_seen
     t0 = time.time()
     last_report = t0
     last_report_tokens = total_tokens
+    last_ckpt_tokens = total_tokens
     step = 1
 
     print(f"\n==================================================================", flush=True)
     print(f" Starting [{stage_name}] Target: {target_tokens:,} tokens", flush=True)
+    print(f" Auto-checkpointing every {ckpt_interval:,} tokens to: {ckpt_dir}", flush=True)
     print(f"==================================================================", flush=True)
 
     for bx, by in loader:
@@ -142,6 +164,22 @@ def train_step_loop(model, loader, optimizer, scheduler, scaler, criterion, devi
             print(f"[{stage_name}] [{pct:5.2f}%] Step {step:,} | Tokens: {total_tokens:,}/{target_tokens:,} | Loss: {loss.item():.4f} | PPL: {ppl:.2f} | Speed: {cur_speed:,.0f} tok/s | LR: {cur_lr:.2e}", flush=True)
             last_report = now
             last_report_tokens = total_tokens
+
+        # Periodic Auto-Checkpointing every 200M tokens
+        if total_tokens - last_ckpt_tokens >= ckpt_interval:
+            ckpt_path = os.path.join(ckpt_dir, f"ckpt_125m_{stage_name[:7].strip().lower()}_{total_tokens}_tokens.pt")
+            torch.save({
+                "step": step,
+                "tokens_seen": total_tokens,
+                "stage": stage_name,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "loss": loss.item()
+            }, ckpt_path)
+            print(f"--> [Checkpoint] Saved progress at {total_tokens:,} tokens to: {ckpt_path}", flush=True)
+            cleanup_old_125m_checkpoints(ckpt_dir, keep_latest=1)
+            last_ckpt_tokens = total_tokens
 
         step += 1
         if total_tokens >= target_tokens:
